@@ -18,6 +18,8 @@ import { ParserOptions, ParserSession, startParserSession } from './ffmpeg-rebro
 import { FileRtspServer } from './file-rtsp-server';
 import { getUrlLocalAdresses } from './local-addresses';
 import { REBROADCAST_MIXIN_INTERFACE_TOKEN } from './rebroadcast-mixin-token';
+import { ReplayBootstrapTracker } from './replay-bootstrap';
+import { calculateReplayBurstBytes, calculateReplayBytesPerSecond, DEFAULT_REPLAY_BURST_BYTES, DEFAULT_REPLAY_MAX_QUEUE_BYTES, ONE_MTU_REPLAY_BURST_BYTES, ONE_MTU_REPLAY_BYTES_PER_SECOND, ReplayPacer, shouldPaceReplay } from './replay-pacer';
 import { connectRFC4571Parser, startRFC4571Parser } from './rfc4571';
 import { startRtmpSession } from './rtmp-session';
 import { RtspSessionParserSpecific, startRtspSession } from './rtsp-session';
@@ -814,6 +816,7 @@ class PrebufferSession {
     session: ParserSession<PrebufferParsers>,
     socketPromise: Promise<Duplex>,
     requestedPrebuffer: number,
+    paceReplay: boolean,
     filter?: (chunk: StreamChunk, prebuffer: boolean) => StreamChunk,
   }) {
     const { isActiveClient, session, socketPromise, requestedPrebuffer } = options;
@@ -853,69 +856,98 @@ class PrebufferSession {
       this.inactivityCheck(session, isActiveClient);
     });
 
-    let writeData = (data: StreamChunk): number => {
-      if (data.startStream) {
-        socket.write(data.startStream)
+    type WriteResult = {
+      buffered: number;
+      backpressured: boolean;
+    };
+
+    let writeStartStream = true;
+    const writeData = (data: StreamChunk): WriteResult => {
+      let backpressured = false;
+      if (writeStartStream && data.startStream) {
+        backpressured = !socket.write(data.startStream) || backpressured;
       }
-
-      const writeDataWithoutStartStream = (data: StreamChunk) => {
-        for (const chunk of data.chunks) {
-          socket.write(chunk);
-        }
-
-        return socket.writableLength;
+      writeStartStream = false;
+      for (const chunk of data.chunks)
+        backpressured = !socket.write(chunk) || backpressured;
+      return {
+        buffered: socket.writableLength,
+        backpressured,
       };
-
-      writeData = writeDataWithoutStartStream;
-      return writeDataWithoutStartStream(data);
     }
 
-    const safeWriteData = (chunk: StreamChunk, prebuffer?: boolean) => {
+    const waitForDrain = () => {
+      if (socket.destroyed || !socket.writableNeedDrain)
+        return;
+      return new Promise<void>(resolve => {
+        const done = () => {
+          socket.removeListener('drain', done);
+          socket.removeListener('close', done);
+          socket.removeListener('error', done);
+          resolve();
+        };
+        socket.once('drain', done);
+        socket.once('close', done);
+        socket.once('error', done);
+      });
+    };
+
+    type ReplayItem = { chunk: StreamChunk; prebuffer: boolean; burstBytes: number };
+    let replayPacer: ReplayPacer<ReplayItem>;
+    let replayBootstrap: ReplayBootstrapTracker;
+    let replayTailBurstBytes = DEFAULT_REPLAY_BURST_BYTES;
+    let cleanedUp = false;
+    let handleLiveData: (chunk: StreamChunk) => void;
+    const cleanup = () => {
+      if (cleanedUp)
+        return;
+      cleanedUp = true;
+      replayPacer?.close();
+      socket.destroy();
+      session.removeListener('rtsp', handleLiveData);
+      session.removeListener('killed', cleanup);
+    };
+
+    const safeWriteData = (chunk: StreamChunk, prebuffer?: boolean, honorBackpressure?: boolean) => {
       if (options.filter) {
         chunk = options.filter(chunk, prebuffer);
         if (!chunk)
           return;
       }
-      const buffered = writeData(chunk);
-      if (buffered > 100000000) {
+      const result = writeData(chunk);
+      if (result.buffered > DEFAULT_REPLAY_MAX_QUEUE_BYTES) {
         this.console.log('more than 100MB has been buffered, did downstream die? killing connection.', this.streamName);
         cleanup();
       }
+      if (honorBackpressure && result.backpressured)
+        return waitForDrain();
     }
 
-    const cleanup = () => {
-      socket.destroy();
-      session.removeListener('rtsp', safeWriteData);
-      session.removeListener('killed', cleanup);
+    handleLiveData = (chunk: StreamChunk) => {
+      if (replayPacer) {
+        replayPacer.enqueue({
+          chunk,
+          prebuffer: false,
+          burstBytes: replayBootstrap.nextBurstBytes(chunk, replayTailBurstBytes),
+        });
+        return;
+      }
+      safeWriteData(chunk);
     };
-
-    session.on('rtsp', safeWriteData);
-    session.once('killed', cleanup);
-
-    socket.once('close', () => {
-      cleanup();
-    });
-
-    // socket.on('error', e => this.console.log('client stream ended'));
-
 
     const now = Date.now();
     const prebufferContainer: PrebufferStreamChunk[] = this.rtspPrebuffer;
+    let availablePrebuffers: PrebufferStreamChunk[];
     // if starting on a sync frame, ffmpeg will skip the first segment while initializing
     // on live sources like rtsp. the buffer before the sync frame stream will be enough
     // for ffmpeg to analyze and start up in time for the sync frame.
     if (!options.findSyncFrame) {
-      for (const chunk of prebufferContainer) {
-        if (chunk.time < now - requestedPrebuffer)
-          continue;
-
-        safeWriteData(chunk, true);
-      }
+      availablePrebuffers = prebufferContainer.filter(chunk => chunk.time >= now - requestedPrebuffer);
     }
     else {
       const parser = this.parsers['rtsp'];
       const filtered = prebufferContainer.filter(pb => pb.time >= now - requestedPrebuffer);
-      let availablePrebuffers = parser.findSyncFrame(filtered);
+      availablePrebuffers = parser.findSyncFrame(filtered);
       if (!availablePrebuffers) {
         this.console.warn('Unable to find sync frame in rtsp prebuffer.');
         availablePrebuffers = [];
@@ -923,9 +955,62 @@ class PrebufferSession {
       else {
         // this.console.log('Found sync frame in rtsp prebuffer.');
       }
+    }
+
+    // Selection and listener installation happen in one synchronous turn. New
+    // live chunks therefore land after the selected snapshot, with no gap or
+    // duplicate boundary packet.
+    session.on('rtsp', handleLiveData);
+    session.once('killed', cleanup);
+    socket.once('close', cleanup);
+
+    if (options.paceReplay && availablePrebuffers.length) {
+      const replayBytes = availablePrebuffers.reduce((total, chunk) =>
+        total + chunk.chunks.reduce((chunkTotal, part) => chunkTotal + part.length, chunk.startStream?.length || 0), 0);
+      const firstTime = availablePrebuffers[0].time;
+      const lastTime = availablePrebuffers[availablePrebuffers.length - 1].time;
+      const replaySpan = lastTime - firstTime;
+      let bytesPerSecond = calculateReplayBytesPerSecond(replayBytes, replaySpan);
+      const stableFirstTime = prebufferContainer[0]?.time;
+      const stableLastTime = prebufferContainer[prebufferContainer.length - 1]?.time;
+      const stableSpan = stableLastTime - stableFirstTime;
+      const stableBytes = prebufferContainer.reduce((total, chunk) =>
+        total + chunk.chunks.reduce((chunkTotal, part) => chunkTotal + part.length, chunk.startStream?.length || 0), 0);
+      replayTailBurstBytes = calculateReplayBurstBytes(replayBytes, replaySpan, stableBytes, stableSpan);
+      if (replayTailBurstBytes === ONE_MTU_REPLAY_BURST_BYTES)
+        bytesPerSecond = Math.min(bytesPerSecond, ONE_MTU_REPLAY_BYTES_PER_SECOND);
+      replayBootstrap = new ReplayBootstrapTracker();
+      const pacer = new ReplayPacer<ReplayItem>({
+        bytesPerSecond,
+        burstBytes: replayTailBurstBytes,
+        maxQueuedBytes: DEFAULT_REPLAY_MAX_QUEUE_BYTES,
+        getBytes: item => item.chunk.chunks.reduce((total, part) => total + part.length, item.chunk.startStream?.length || 0),
+        getBurstBytes: item => item.burstBytes,
+        write: item => safeWriteData(item.chunk, item.prebuffer, true),
+        onCaughtUp: () => {
+          if (replayPacer === pacer)
+            replayPacer = undefined;
+        },
+        onError: e => {
+          this.console.warn('prebuffer replay pacing failed, closing client.', this.streamName, e.message);
+          cleanup();
+        },
+      });
+      replayPacer = pacer;
       for (const prebuffer of availablePrebuffers) {
-        safeWriteData(prebuffer, true);
+        pacer.enqueue({
+          chunk: prebuffer,
+          prebuffer: true,
+          burstBytes: replayBootstrap.nextBurstBytes(prebuffer, replayTailBurstBytes),
+        });
       }
+      pacer.start();
+    }
+    else {
+      // Explicit prebuffer requests (including HKSV pre-roll) intentionally keep
+      // the original synchronous, byte-for-byte delivery behavior.
+      for (const prebuffer of availablePrebuffers)
+        safeWriteData(prebuffer, true);
     }
   }
 
@@ -940,6 +1025,7 @@ class PrebufferSession {
     const session = await this.parserSessionPromise;
 
     let requestedPrebuffer = options?.prebuffer;
+    const paceReplay = shouldPaceReplay(requestedPrebuffer);
     // if no prebuffer was requested, try to find a sync frame in the prebuffer.
     // also do this if this request initiated the prebuffer: so, an explicit request for 0 prebuffer
     // will still send the initial sync frame in the stream start. it may otherwise be missed
@@ -1068,6 +1154,7 @@ class PrebufferSession {
       socketPromise,
       session,
       filter,
+      paceReplay,
     });
     mediaStreamOptions.prebuffer = 0;
 
@@ -1235,6 +1322,7 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
           session,
           socketPromise: Promise.resolve(client),
           requestedPrebuffer,
+          paceReplay: false,
           filter: (chunk, prebuffer) => {
             const track = map.get(chunk.type);
             if (track) {
