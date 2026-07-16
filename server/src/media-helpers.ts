@@ -74,23 +74,36 @@ export function safePrintFFmpegArguments(console: Console, args: string[]) {
     if (!console)
         return;
     const ret = [];
-    let redactNext = false;
+    let redactNext: 'input' | 'secret' | undefined;
     for (const arg of args) {
-        try {
-            if (redactNext) {
-                const url = new URL(arg);
-                ret.push(`${url.protocol}[REDACTED]`)
+        const redact = redactNext;
+        redactNext = undefined;
+
+        if (redact === 'secret') {
+            ret.push('[REDACTED]');
+        }
+        else {
+            try {
+                if (redact === 'input') {
+                    const url = new URL(arg);
+                    ret.push(`${url.protocol}[REDACTED]`)
+                }
+                else {
+                    ret.push(arg);
+                }
             }
-            else {
+            catch (e) {
+                // Preserve ordinary local input paths.
                 ret.push(arg);
             }
         }
-        catch (e) {
-            ret.push(arg);
-        }
 
-        // input arguments may contain passwords.
-        redactNext = arg === '-i';
+        if (arg === '-i')
+            redactNext = 'input';
+        else if (arg === '-srtp_in_params' || arg === '-srtp_out_params')
+            redactNext = 'secret';
+        else
+            redactNext = undefined;
     }
 
     console.log(ret.join(' '));
