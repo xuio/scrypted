@@ -8,6 +8,7 @@ import child_process, { ChildProcess } from 'child_process';
 import dgram from 'dgram';
 import { Writable } from "stream";
 import { RtpPacket } from "../../../external/werift/packages/rtp/src/rtp/rtp";
+import { EarlyAudioBuffer } from "./early-audio-buffer";
 
 const { mediaManager } = sdk;
 
@@ -280,63 +281,74 @@ export async function startRtpForwarderProcess(console: Console, ffmpegInput: FF
 
                         let firstPacket = true;
                         let adts = false;
+                        const earlyAudioBuffer = new EarlyAudioBuffer();
+                        killDeferred.promise.finally(() => earlyAudioBuffer.close());
 
                         // if the rtsp client is over tcp, then the restream server must also be tcp, as
                         // the rtp packets (which can be a max of 64k) may be too large for udp.
                         const clientIsTcp = await setupRtspClient(console, rtspClient, channel, audioSection, false, rtp => {
-                            // live555 sends rtp aac packets without AU header followed by ADTS packets (which contain codec info)
-                            // which ffmpeg can not handle.
-                            // the solution is to demux the adts and send that to ffmpeg raw.
-                            // https://github.com/mpv-player/mpv/issues/5669#issuecomment-932519409
-                            if (firstPacket) {
-                                firstPacket = false;
-                                if (audioSection.codec === 'aac') {
-                                    const packet = RtpPacket.deSerialize(rtp);
-                                    const buf = packet.payload;
-                                    // adts header is 12 bits of 1s
-                                    if (buf[0] == 0xff && (buf[1] & 0xf0) == 0xf0) {
-                                        adts = true;
-                                        allowAudioTranscoderExit = true;
-                                        const ffmpegArgs = [
-                                            '-hide_banner',
-                                            '-f', 'aac',
-                                            '-i', 'pipe:3',
-                                            ...audio.encoderArguments,
-                                            ...audio.outputArguments,
-                                        ];
-
-                                        safePrintFFmpegArguments(console, ffmpegArgs);
-                                        const cp = child_process.spawn(ffmpegPath, ffmpegArgs, {
-                                            stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
-                                        });
-                                        ffmpegLogInitialOutput(console, cp);
-                                        killDeferred.promise.finally(() => safeKillFFmpeg(cp));
-                                        cp.on('exit', () => killDeferred.resolve(undefined));
-                                        cp.on('error', () => killDeferred.resolve(undefined));
-
-                                        audioPipe = cp.stdio[3] as Writable;
-                                    }
-                                }
-                            }
-
-                            if (!adts) {
-                                rtspServer?.sendTrack(audioControl, rtp, false);
-                            }
-                            else {
-                                const packet = RtpPacket.deSerialize(rtp);
-                                audioPipe?.write(packet.payload);
-                            }
+                            earlyAudioBuffer.push(rtp);
                         });
 
                         const audioClient = await listenZeroSingleClient('127.0.0.1');
                         let audioPipe: Writable;
                         killDeferred.promise.finally(() => audioClient.clientPromise.then(client => client.destroy()));
-                        let rtspServer: RtspServer;
                         audioClient.clientPromise.then(async client => {
                             const r = new RtspServer(client, audioSdp, !clientIsTcp);
                             killDeferred.promise.finally(() => r.destroy());
                             await r.handlePlayback();
-                            rtspServer = r;
+                            earlyAudioBuffer.setReady(rtp => {
+                                // live555 sends RTP AAC packets without an AU
+                                // header followed by ADTS payloads. Delay this
+                                // first-packet decision until the bridge is
+                                // ready so createTrackForwarders has initialized
+                                // audio.outputArguments.
+                                // https://github.com/mpv-player/mpv/issues/5669#issuecomment-932519409
+                                if (firstPacket) {
+                                    firstPacket = false;
+                                    if (audioSection.codec === 'aac') {
+                                        const packet = RtpPacket.deSerialize(rtp);
+                                        const buf = packet.payload;
+                                        // ADTS sync word is 12 one bits.
+                                        if (buf[0] == 0xff && (buf[1] & 0xf0) == 0xf0) {
+                                            adts = true;
+                                            allowAudioTranscoderExit = true;
+                                            const ffmpegArgs = [
+                                                '-hide_banner',
+                                                '-f', 'aac',
+                                                '-i', 'pipe:3',
+                                                ...audio.encoderArguments,
+                                                ...audio.outputArguments,
+                                            ];
+
+                                            safePrintFFmpegArguments(console, ffmpegArgs);
+                                            const cp = child_process.spawn(ffmpegPath, ffmpegArgs, {
+                                                stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
+                                            });
+                                            ffmpegLogInitialOutput(console, cp);
+                                            killDeferred.promise.finally(() => safeKillFFmpeg(cp));
+                                            cp.on('exit', () => killDeferred.resolve(undefined));
+                                            cp.on('error', () => killDeferred.resolve(undefined));
+
+                                            audioPipe = cp.stdio[3] as Writable;
+                                        }
+                                    }
+                                }
+
+                                if (!adts) {
+                                    r.sendTrack(audioControl, rtp, false);
+                                }
+                                else {
+                                    const packet = RtpPacket.deSerialize(rtp);
+                                    audioPipe?.write(packet.payload);
+                                }
+                            });
+                            if (earlyAudioBuffer.droppedPackets) {
+                                console.warn('dropped early audio RTP packets while waiting for the local RTSP bridge.', {
+                                    packets: earlyAudioBuffer.droppedPackets,
+                                    expired: earlyAudioBuffer.expiredPackets,
+                                });
+                            }
                         })
                             .catch(e => {
                                 if (!killDeferred.finished)

@@ -1,0 +1,11 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "outDir": "./build-test",
+        "rootDir": "."
+    },
+    "include": [
+        "src/early-audio-buffer.ts",
+        "test/**/*.ts"
+    ]
+}
