@@ -9,6 +9,7 @@ const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
+const { parseHttpMessages } = require("./hap-trace-analyze");
 
 const SCRIPT_DIRECTORY = __dirname;
 
@@ -201,6 +202,26 @@ async function main() {
             0xff, 0xd9,
         ]);
         const jpegHash = crypto.createHash("sha256").update(jpeg).digest("hex");
+        const chunkedResponse = Buffer.concat([
+            Buffer.from(
+                "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: image/jpeg\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\n"
+                + `${jpeg.length.toString(16)}\r\n`,
+            ),
+            jpeg,
+            Buffer.from("\r\n0\r\n\r\n"),
+        ]);
+        const consecutiveChunked = parseHttpMessages(Buffer.concat([
+            chunkedResponse,
+            chunkedResponse,
+        ]));
+        assert.equal(consecutiveChunked.messages.length, 2);
+        assert.equal(consecutiveChunked.trailingBytes, 0);
+        assert.deepEqual(
+            consecutiveChunked.messages.map(message => message.body.sha256),
+            [jpegHash, jpegHash],
+        );
         const requestId = "self-test-resource-1";
         await sendProducerSession(control, [
             {

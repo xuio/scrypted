@@ -545,6 +545,33 @@ test('wire trace correlates resource requests, encrypted records, keys, and sock
         allRequestsComplete: true,
     });
 
+    const chunkedResponse = Buffer.concat([
+        Buffer.from(
+            'HTTP/1.1 200 OK\r\n'
+            + 'Content-Type: image/jpeg\r\n'
+            + 'Transfer-Encoding: chunked\r\n\r\n'
+            + '2\r\n',
+        ),
+        jpeg.subarray(0, 2),
+        Buffer.from('\r\n2\r\n'),
+        jpeg.subarray(2),
+        Buffer.from('\r\n0\r\n\r\n'),
+    ]);
+    traceHapResponseBoundary(connection, {
+        requestId: 'resource-response-2',
+        method: 'POST',
+        url: '/resource',
+        data: chunkedResponse.subarray(0, 73),
+    });
+    traceHapResponseBoundary(connection, {
+        requestId: 'resource-response-2',
+        method: 'POST',
+        url: '/resource',
+        data: chunkedResponse.subarray(73),
+        responseComplete: true,
+        allRequestsComplete: true,
+    });
+
     const byType = new Map<string, HapWireTraceEvent[]>();
     for (const { event } of sink.events) {
         const events = byType.get(event.type) || [];
@@ -565,11 +592,19 @@ test('wire trace correlates resource requests, encrypted records, keys, and sock
     );
     assert.equal(byType.get('hap-socket-write')?.[0]?.accepted, false);
     assert.equal(byType.get('hap-socket-write-complete')?.length, 1);
-    const resourceResponse = byType.get('hap-resource-response')?.[0];
+    const resourceResponses = byType.get('hap-resource-response') || [];
+    assert.equal(resourceResponses.length, 2);
+    const resourceResponse = resourceResponses[0];
     assert.equal(resourceResponse?.statusCode, 200);
     assert.equal(resourceResponse?.contentLengthMatches, true);
     assert.equal(resourceResponse?.bodySha256, createHash('sha256').update(jpeg).digest('hex'));
     assert.deepEqual(resourceResponse?.jpeg, inspectHapTraceJpeg(jpeg));
+    const chunkedResourceResponse = resourceResponses[1];
+    assert.equal(chunkedResourceResponse?.transferEncoding, 'chunked');
+    assert.equal(chunkedResourceResponse?.chunkedBodyComplete, true);
+    assert.equal(chunkedResourceResponse?.bodyBytes, jpeg.length);
+    assert.equal(chunkedResourceResponse?.bodySha256, createHash('sha256').update(jpeg).digest('hex'));
+    assert.deepEqual(chunkedResourceResponse?.jpeg, inspectHapTraceJpeg(jpeg));
     assert.strictEqual(callbackThis, connection.tcpSocket);
     assert.ok(sink.events.some(entry => entry.sensitive
         && entry.event.type === 'hap-session-keys'));

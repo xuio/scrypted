@@ -284,6 +284,7 @@ function summarizeEvents(events) {
             if (type === "hap-resource-response") {
                 const jpeg = event.jpeg || {};
                 const successful = event.statusCode === 200 && event.truncated !== true;
+                const chunked = /(?:^|,)\s*chunked\s*(?:,|$)/i.test(String(event.transferEncoding || ""));
                 item.resourceResponse = {
                     accessory: event.accessory,
                     statusLine: event.statusLine,
@@ -295,6 +296,8 @@ function summarizeEvents(events) {
                     contentType: event.contentType,
                     declaredContentLength: event.declaredContentLength,
                     transferEncoding: event.transferEncoding,
+                    wireBodyBytes: event.wireBodyBytes,
+                    chunkedBodyComplete: event.chunkedBodyComplete,
                     bodyBytes: event.bodyBytes,
                     rawSha256: event.rawSha256,
                     bodySha256: event.bodySha256,
@@ -320,7 +323,8 @@ function summarizeEvents(events) {
                     event.truncated === true && "trace response exceeded capture bound",
                     event.statusCode !== undefined && event.statusCode !== 200 && `HTTP ${event.statusCode}`,
                     successful && !/^image\/jpeg(?:\s*;|$)/i.test(String(event.contentType || "")) && "missing/non-JPEG Content-Type",
-                    successful && event.declaredContentLength === undefined && "missing Content-Length",
+                    successful && event.declaredContentLength === undefined && !chunked && "missing HTTP body framing",
+                    successful && chunked && event.chunkedBodyComplete === false && "invalid/incomplete chunked body",
                     successful && !(event.bodyBytes > 0) && "empty JPEG body",
                     successful && !event.bodySha256 && "missing JPEG body hash",
                     event.contentLengthMatches === false && "Content-Length mismatch",
@@ -662,11 +666,27 @@ function parseChunkedBody(buffer, offset) {
         if (!/^[0-9a-f]+$/i.test(sizeText))
             return;
         const size = Number.parseInt(sizeText, 16);
+        if (!Number.isSafeInteger(size) || size < 0)
+            return;
         cursor = lineEnd + 2;
         if (size === 0) {
-            const end = buffer.indexOf("\r\n\r\n", cursor, "ascii");
-            const consumed = end === -1 ? cursor + 2 : end + 4;
-            return { body: Buffer.concat(chunks), consumed: consumed - offset };
+            // The final chunk is followed by zero or more trailer fields and a
+            // terminating empty line. Searching for CRLFCRLF here skips the
+            // next HTTP response when there are no trailers: at this point the
+            // empty trailer section is only one CRLF.
+            while (true) {
+                const trailerEnd = buffer.indexOf("\r\n", cursor, "ascii");
+                if (trailerEnd === -1)
+                    return;
+                if (trailerEnd === cursor) {
+                    cursor += 2;
+                    return { body: Buffer.concat(chunks), consumed: cursor - offset };
+                }
+                const trailer = buffer.subarray(cursor, trailerEnd).toString("latin1");
+                if (!trailer.includes(":"))
+                    return;
+                cursor = trailerEnd + 2;
+            }
         }
         if (cursor + size + 2 > buffer.length)
             return;
@@ -1140,10 +1160,17 @@ function main() {
     })}\n`);
 }
 
-try {
-    main();
-}
-catch (error) {
-    process.stderr.write(`${error.stack || error.message}\n`);
-    process.exitCode = 1;
+module.exports = {
+    parseChunkedBody,
+    parseHttpMessages,
+};
+
+if (require.main === module) {
+    try {
+        main();
+    }
+    catch (error) {
+        process.stderr.write(`${error.stack || error.message}\n`);
+        process.exitCode = 1;
+    }
 }

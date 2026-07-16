@@ -23,6 +23,7 @@ const MAX_RESOURCE_REQUEST_BYTES = 64 * 1024;
 const MAX_CONTROL_BYTES = 8 * 1024;
 const MAX_RESOURCE_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_RESOURCE_RESPONSES_PER_CONNECTION = 4;
+const MAX_CHUNK_LINE_BYTES = 8 * 1024;
 const HTTP_HEADER_END = Buffer.from('\r\n\r\n');
 
 interface TraceControl {
@@ -850,6 +851,52 @@ export function inspectHapTraceJpeg(jpeg: Buffer) {
     return result;
 }
 
+function decodeChunkedBody(wireBody: Buffer) {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let cursor = 0;
+    while (true) {
+        const lineEnd = wireBody.indexOf('\r\n', cursor, 'latin1');
+        if (lineEnd < 0 || lineEnd - cursor > MAX_CHUNK_LINE_BYTES)
+            return;
+        const sizeText = wireBody.subarray(cursor, lineEnd)
+            .toString('latin1')
+            .split(';', 1)[0]
+            .trim();
+        if (!/^[0-9a-f]+$/i.test(sizeText))
+            return;
+        const size = Number.parseInt(sizeText, 16);
+        if (!Number.isSafeInteger(size) || size < 0)
+            return;
+        cursor = lineEnd + 2;
+        if (!size) {
+            while (true) {
+                const trailerEnd = wireBody.indexOf('\r\n', cursor, 'latin1');
+                if (trailerEnd < 0 || trailerEnd - cursor > MAX_CHUNK_LINE_BYTES)
+                    return;
+                if (trailerEnd === cursor) {
+                    cursor += 2;
+                    if (cursor !== wireBody.length)
+                        return;
+                    return Buffer.concat(chunks, bytes);
+                }
+                const trailer = wireBody.subarray(cursor, trailerEnd).toString('latin1');
+                if (!trailer.includes(':'))
+                    return;
+                cursor = trailerEnd + 2;
+            }
+        }
+        if (cursor + size + 2 > wireBody.length)
+            return;
+        chunks.push(wireBody.subarray(cursor, cursor + size));
+        bytes += size;
+        cursor += size;
+        if (wireBody[cursor] !== 0x0d || wireBody[cursor + 1] !== 0x0a)
+            return;
+        cursor += 2;
+    }
+}
+
 function captureHapResourceResponse(
     connection: Record<PropertyKey, any>,
     sink: HapWireTraceSink,
@@ -927,7 +974,9 @@ function captureHapResourceResponse(
     let contentType: string | undefined;
     let declaredContentLength: number | undefined;
     let transferEncoding: string | undefined;
+    let wireBody: Buffer | undefined;
     let body: Buffer | undefined;
+    let chunkedBodyComplete: boolean | undefined;
     if (marker >= 0) {
         const lines = raw.subarray(0, marker).toString('latin1').split('\r\n');
         statusLine = lines.shift();
@@ -947,12 +996,21 @@ function captureHapResourceResponse(
             else if (name === 'transfer-encoding')
                 transferEncoding = value;
         }
-        body = raw.subarray(marker + HTTP_HEADER_END.length);
+        wireBody = raw.subarray(marker + HTTP_HEADER_END.length);
+        const chunked = transferEncoding
+            ?.split(',')
+            .some(value => value.trim().toLowerCase() === 'chunked');
+        if (chunked && !response.truncated) {
+            body = decodeChunkedBody(wireBody);
+            chunkedBodyComplete = body !== undefined;
+        }
+        else {
+            body = wireBody;
+        }
     }
 
     const jpeg = body
         && !response.truncated
-        && !transferEncoding
         && body.length >= 2
         && body[0] === 0xff
         && body[1] === 0xd8
@@ -971,6 +1029,8 @@ function captureHapResourceResponse(
         contentType,
         declaredContentLength,
         transferEncoding,
+        wireBodyBytes: wireBody?.length,
+        chunkedBodyComplete,
         bodyBytes: body?.length,
         bodySha256: body && !response.truncated ? sha256(body) : undefined,
         contentLengthMatches: body && declaredContentLength !== undefined
