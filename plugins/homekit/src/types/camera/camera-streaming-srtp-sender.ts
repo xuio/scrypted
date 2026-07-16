@@ -6,8 +6,8 @@ import { SrtpSession } from '@koush/werift-src/packages/rtp/src/srtp/srtp';
 import { getNaluTypesInNalu, H264_NAL_TYPE_IDR } from '@scrypted/common/src/rtsp-server';
 import dgram from 'dgram';
 import { AudioStreamingSamplerate } from '../../hap';
-import { ntpTime } from './camera-utils';
 import { H264Repacketizer } from './h264-packetizer';
+import { ntpTime } from './camera-streaming-ntp';
 import { OpusRepacketizer, repacketizeOpusOrDrop } from './opus-repacketizer';
 import throttle from 'lodash/throttle';
 
