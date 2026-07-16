@@ -4,6 +4,8 @@ import {
   calculateReplayBurstBytes,
   calculateReplayBytesPerSecond,
   DEFAULT_REPLAY_BURST_BYTES,
+  getHomeKitReplayBootstrapBytesPerSecond,
+  HOMEKIT_REPLAY_BOOTSTRAP_METADATA_KEY,
   MAX_REPLAY_BYTES_PER_SECOND,
   MIN_REPLAY_BYTES_PER_SECOND,
   ONE_MTU_REPLAY_BURST_BYTES,
@@ -51,6 +53,30 @@ test('implicit and explicit-zero live bootstrap are paced; positive HKSV pre-rol
   assert.equal(shouldPaceReplay(undefined), true);
   assert.equal(shouldPaceReplay(0), true);
   assert.equal(shouldPaceReplay(10_000), false);
+});
+
+test('HomeKit bootstrap rate hints are capability-gated and allowlisted', () => {
+  for (const bytesPerSecond of [1_000_000, 1_250_000, 1_500_000]) {
+    assert.equal(getHomeKitReplayBootstrapBytesPerSecond({
+      destinationType: '@scrypted/homekit',
+      metadata: {
+        [HOMEKIT_REPLAY_BOOTSTRAP_METADATA_KEY]: bytesPerSecond,
+      },
+    }), bytesPerSecond);
+  }
+
+  assert.equal(getHomeKitReplayBootstrapBytesPerSecond({
+    destinationType: '@scrypted/webrtc',
+    metadata: {
+      [HOMEKIT_REPLAY_BOOTSTRAP_METADATA_KEY]: 1_500_000,
+    },
+  }), undefined);
+  assert.equal(getHomeKitReplayBootstrapBytesPerSecond({
+    destinationType: '@scrypted/homekit',
+    metadata: {
+      [HOMEKIT_REPLAY_BOOTSTRAP_METADATA_KEY]: 2_000_000,
+    },
+  }), undefined);
 });
 
 test('live ingress appended during replay never overtakes the cached FIFO', async () => {
@@ -127,6 +153,31 @@ test('token bucket honors the initial burst and deterministic refill rate', asyn
   assert.deepEqual(written, ['first', 'second']);
   assert.equal(sleeps.length, 1);
   assert.ok(Math.abs(sleeps[0] - 20) < 0.0001);
+});
+
+test('per-item rate changes only the selected replay records', async () => {
+  let now = 0;
+  const sleeps: number[] = [];
+  const pacer = new ReplayPacer<Item & { rate?: number }>({
+    bytesPerSecond: 1_000,
+    burstBytes: 100,
+    maxQueuedBytes: 1_000,
+    now: () => now,
+    sleep: async milliseconds => {
+      sleeps.push(milliseconds);
+      now += milliseconds;
+    },
+    getBytes: item => item.bytes,
+    getBytesPerSecond: item => item.rate,
+    write: () => { },
+  });
+  pacer.enqueue({ id: 'primer', bytes: 100, prebuffer: true });
+  pacer.enqueue({ id: 'bootstrap', bytes: 100, prebuffer: true, rate: 2_000 });
+  pacer.enqueue({ id: 'tail', bytes: 100, prebuffer: true });
+  pacer.start();
+  await pacer.waitForIdle();
+
+  assert.deepEqual(sleeps, [50, 100]);
 });
 
 test('an indivisible record larger than the burst is written whole and charges token debt', async () => {

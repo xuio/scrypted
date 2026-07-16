@@ -17,6 +17,23 @@ export const DEFAULT_REPLAY_BURST_BYTES = 3000;
 export const MAX_ONE_MTU_SOURCE_BYTES_PER_SECOND = 500_000; // 4 Mbit/s
 export const MIN_STABLE_RATE_SPAN_MS = 4000;
 export const DEFAULT_REPLAY_MAX_QUEUE_BYTES = 100_000_000;
+export const HOMEKIT_REPLAY_BOOTSTRAP_METADATA_KEY = 'homekitReplayBootstrapBytesPerSecond';
+export const HOMEKIT_REPLAY_BOOTSTRAP_BYTES_PER_SECOND = new Set([
+  1_000_000, // 8 Mbit/s
+  1_250_000, // 10 Mbit/s
+  1_500_000, // 12 Mbit/s
+]);
+
+export function getHomeKitReplayBootstrapBytesPerSecond(options?: {
+  destinationType?: string;
+  metadata?: any;
+}) {
+  if (options?.destinationType !== '@scrypted/homekit')
+    return;
+  const value = options.metadata?.[HOMEKIT_REPLAY_BOOTSTRAP_METADATA_KEY];
+  if (HOMEKIT_REPLAY_BOOTSTRAP_BYTES_PER_SECOND.has(value))
+    return value as number;
+}
 
 /**
  * Select a replay rate that drains a finite prebuffer quickly without turning it
@@ -65,6 +82,7 @@ export interface ReplayPacerOptions<T> {
   write: (item: T) => void | Promise<void>;
   getBytes: (item: T) => number;
   getBurstBytes?: (item: T) => number;
+  getBytesPerSecond?: (item: T) => number | undefined;
   burstBytes?: number;
   maxQueuedBytes?: number;
   now?: () => number;
@@ -81,7 +99,7 @@ export interface ReplayPacerOptions<T> {
  * synchronous live writer after onCaughtUp.
  */
 export class ReplayPacer<T> {
-  private queue: { item: T; bytes: number; burstBytes: number }[] = [];
+  private queue: { item: T; bytes: number; burstBytes: number; bytesPerSecond: number }[] = [];
   private head = 0;
   private queuedBytes = 0;
   private tokens: number;
@@ -123,13 +141,19 @@ export class ReplayPacer<T> {
       return false;
     }
 
+    const bytesPerSecond = this.options.getBytesPerSecond?.(item) ?? this.options.bytesPerSecond;
+    if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) {
+      this.fail(new Error(`Invalid replay item rate: ${bytesPerSecond}.`));
+      return false;
+    }
+
     const maxQueuedBytes = this.options.maxQueuedBytes ?? DEFAULT_REPLAY_MAX_QUEUE_BYTES;
     if (this.queuedBytes + bytes > maxQueuedBytes) {
       this.fail(new Error(`Replay queue exceeded ${maxQueuedBytes} bytes.`));
       return false;
     }
 
-    this.queue.push({ item, bytes, burstBytes });
+    this.queue.push({ item, bytes, burstBytes, bytesPerSecond });
     this.queuedBytes += bytes;
     if (this.started)
       this.startPump();
@@ -183,7 +207,7 @@ export class ReplayPacer<T> {
     try {
       while (!this.closed && this.head < this.queue.length) {
         const queued = this.queue[this.head];
-        await this.waitForBudget(queued.bytes, queued.burstBytes);
+        await this.waitForBudget(queued.bytes, queued.burstBytes, queued.bytesPerSecond);
         if (this.closed)
           break;
 
@@ -212,14 +236,14 @@ export class ReplayPacer<T> {
     }
   }
 
-  private refill(burstBytes: number) {
+  private refill(burstBytes: number, bytesPerSecond: number) {
     const now = this.now();
     const elapsed = Math.max(0, now - this.lastRefill);
     this.lastRefill = now;
-    this.tokens = Math.min(burstBytes, this.tokens + elapsed * this.options.bytesPerSecond / 1000);
+    this.tokens = Math.min(burstBytes, this.tokens + elapsed * bytesPerSecond / 1000);
   }
 
-  private async waitForBudget(bytes: number, burstBytes: number) {
+  private async waitForBudget(bytes: number, burstBytes: number, bytesPerSecond: number) {
     // A StreamChunk is one indivisible RTP/RTSP record. A maximum-size
     // interleaved frame can be a few bytes larger than the configured burst;
     // send that record atomically once the bucket is full, then carry the
@@ -231,12 +255,12 @@ export class ReplayPacer<T> {
     this.tokens = Math.min(this.tokens, burstBytes);
 
     while (!this.closed) {
-      this.refill(burstBytes);
+      this.refill(burstBytes, bytesPerSecond);
       if (this.tokens >= requiredTokens) {
         this.tokens -= bytes;
         return;
       }
-      await this.sleep((requiredTokens - this.tokens) * 1000 / this.options.bytesPerSecond);
+      await this.sleep((requiredTokens - this.tokens) * 1000 / bytesPerSecond);
     }
   }
 

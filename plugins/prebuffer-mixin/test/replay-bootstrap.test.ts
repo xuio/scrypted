@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { BOOTSTRAP_REPLAY_BURST_BYTES, ReplayBootstrapTracker } from '../src/replay-bootstrap';
+import { BOOTSTRAP_REPLAY_BURST_BYTES, filterPrebufferReplayChunks, ReplayBootstrapTracker, shouldBypassReplayForLiveAudio } from '../src/replay-bootstrap';
 import { DEFAULT_REPLAY_BURST_BYTES } from '../src/replay-pacer';
 
 function rtp(type: 'h264' | 'h265' | 'aac' | 'rtcp-h264', payload: number[], marker = false, timestamp = 100, ssrc = 200) {
@@ -100,4 +100,55 @@ test('audio and RTCP retain the one-MTU budget after video leaves bootstrap', ()
     rtp('h264', [0x41], true, 104, 200),
   ];
   assert.deepEqual(bursts(chunks), [1500, 3000, 1500, 1500, 3000]);
+});
+
+test('decoder bootstrap classification excludes audio and the catch-up tail', () => {
+  const tracker = new ReplayBootstrapTracker();
+  const chunks = [
+    rtp('h264', [0x67]),
+    rtp('aac', [1, 2], true),
+    rtp('h264', [0x65], true),
+    rtp('h264', [0x41], true, 101),
+  ];
+
+  assert.deepEqual(chunks.map(chunk => tracker.nextPacing(chunk, DEFAULT_REPLAY_BURST_BYTES)), [
+    { burstBytes: 1500, decoderBootstrap: true },
+    { burstBytes: 1500, decoderBootstrap: false },
+    { burstBytes: 1500, decoderBootstrap: true },
+    { burstBytes: 3000, decoderBootstrap: false },
+  ]);
+});
+
+test('implicit replay removes cached audio and RTCP before pacing while explicit pre-roll preserves them', () => {
+  const chunks = [
+    rtp('h264', [0x67]),
+    rtp('aac', [1, 2], true),
+    rtp('rtcp-h264', [1, 2], true),
+    rtp('h264', [0x65], true),
+  ];
+
+  assert.deepEqual(
+    filterPrebufferReplayChunks(chunks, 'h264').map(chunk => chunk.type),
+    ['h264', 'h264'],
+  );
+  assert.equal(filterPrebufferReplayChunks(chunks), chunks);
+  assert.deepEqual(filterPrebufferReplayChunks(chunks, ''), []);
+});
+
+test('implicit live replay bypasses only the exact selected live audio codec', () => {
+  const check = (chunkType: string, implicitLiveAudioCodec: string | undefined, replayRecordWritten = true, writableNeedDrain = false) =>
+    shouldBypassReplayForLiveAudio({
+      chunkType,
+      implicitLiveAudioCodec,
+      replayRecordWritten,
+      writableNeedDrain,
+    });
+
+  assert.equal(check('aac', 'aac'), true);
+  assert.equal(check('rtcp-aac', 'aac'), false);
+  assert.equal(check('h264', 'aac'), false);
+  assert.equal(check('unknown', 'aac'), false);
+  assert.equal(check('aac', undefined), false);
+  assert.equal(check('aac', 'aac', false), false);
+  assert.equal(check('aac', 'aac', true, true), false);
 });
