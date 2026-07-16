@@ -300,6 +300,18 @@ async function main() {
         assert.ok(events.every(event => event._traceToken === undefined));
         assert.ok(events.every(event => event.accessoryToControllerKey === undefined));
 
+        const homeLogPath = path.join(runDir, "home-unified-log.jsonl");
+        fs.writeFileSync(homeLogPath, `Filtering the log data\n${JSON.stringify([
+            {
+                timestamp: "2026-07-16 23:59:59.000000+0200",
+                process: "Home",
+                subsystem: "com.apple.HomeKit",
+                category: "camera.snapshot",
+                eventMessage: "snapshot self-test marker",
+            },
+        ], null, 2)}\n`, { mode: 0o600 });
+        privateMode(homeLogPath, 0o600);
+
         const analyzer = spawnSync(process.execPath, [
             path.join(SCRIPT_DIRECTORY, "hap-trace-analyze.js"),
             "--run-dir", runDir,
@@ -318,6 +330,8 @@ async function main() {
         assert.equal(analysis.events.resourceRequests[0].resourceResponse.jpeg.jfif, false);
         assert.equal(analysis.events.snapshotResults[0].firstMarker, "0xc0");
         assert.equal(analysis.events.snapshotResults[0].jfif, false);
+        assert.equal(analysis.homeLogs[0].count, 1);
+        assert.equal(analysis.homeLogs[0].diagnosticMarkerCount, 1);
         assert.equal(analysis.snapshotBodyCorrelations[0].exactSourceMatchCount, 1);
 
         process.stdout.write(`${JSON.stringify({

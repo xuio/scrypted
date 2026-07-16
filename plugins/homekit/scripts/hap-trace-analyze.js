@@ -136,8 +136,26 @@ function writePrivate(filePath, data) {
 function readJsonLines(filePath, errors, ignoreNonJson = false) {
     if (!filePath || !fs.existsSync(filePath))
         return [];
+    const contents = fs.readFileSync(filePath, "utf8");
+    if (ignoreNonJson) {
+        // `log stream --style json` writes one pretty-printed JSON array and
+        // may prefix it with a human-readable filter banner. Prefer that
+        // native shape before falling back to NDJSON/event-per-line inputs.
+        const arrayStart = /\[\s*(?:\{|\])/.exec(contents)?.index;
+        const arrayEnd = contents.lastIndexOf("]");
+        if (arrayStart !== undefined && arrayEnd >= arrayStart) {
+            try {
+                const parsed = JSON.parse(contents.slice(arrayStart, arrayEnd + 1));
+                if (Array.isArray(parsed))
+                    return parsed.filter(value => value && typeof value === "object");
+            }
+            catch (e) {
+                errors.push(`${path.basename(filePath)}: JSON array: ${e.message}`);
+            }
+        }
+    }
     const result = [];
-    const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+    const lines = contents.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
         if (!lines[i].trim())
             continue;
