@@ -8,6 +8,7 @@ import { maybeAddBatteryService } from './battery';
 import { CameraMixin, canCameraMixin } from './camera-mixin';
 import { SnapshotThrottle, supportedTypes } from './common';
 import { Accessory, Bridge, Categories, Characteristic, ControllerStorage, HAPStorage, MDNSAdvertiser, PublishInfo, Service } from './hap';
+import { installHapResponseBoundaryGuard } from './hap-response-boundary-guard';
 import { createHAPUsernameStorageSettingsDict, getRandomPort as createRandomPort, getHAPUUID, logConnections, typeToCategory } from './hap-utils';
 import { HOMEKIT_MIXIN, HomekitMixin } from './homekit-mixin';
 import { addAccessoryDeviceInfo } from './info';
@@ -17,6 +18,9 @@ import { VIDEO_CLIPS_NATIVE_ID } from './types/camera/camera-recording-files';
 import { reorderDevicesByProvider } from './util';
 import { VideoClipsMixinProvider } from './video-clips-provider';
 import QRCode from 'qrcode-svg';
+
+if (!installHapResponseBoundaryGuard())
+    throw new Error('HomeKit HAP response-boundary guard could not be installed');
 
 const hapStorage: Storage = {
     get length() {

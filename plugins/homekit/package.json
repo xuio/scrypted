@@ -37,7 +37,7 @@
       "realfs": true
    },
    "dependencies": {
-      "@homebridge/hap-nodejs": "^2.1.3",
+      "@homebridge/hap-nodejs": "2.1.8",
       "@koush/werift-src": "file:../../external/werift",
       "check-disk-space": "^3.4.0",
       "lodash": "^4.17.21",
