@@ -1,29 +1,9 @@
 import sdk, { AudioSensor, Camera, Intercom, Logger, MotionSensor, ScryptedDevice, ScryptedInterface, VideoCamera } from "@scrypted/sdk";
-import { ResourceRequestReason, SnapshotRequest, SnapshotRequestCallback } from "../../hap";
+import { SnapshotRequest, SnapshotRequestCallback } from "../../hap";
 import type { HomeKitPlugin } from "../../main";
-import { CameraSnapshotCache, compactSnapshotError } from "./camera-snapshot-cache";
+import { compactSnapshotError, isEventSnapshotReason } from "./camera-snapshot-policy";
 
 const { systemManager, mediaManager } = sdk;
-const PERIODIC_SNAPSHOT_TIMEOUT_MS = 6_000;
-const EVENT_SNAPSHOT_TIMEOUT_MS = 5_000;
-
-async function withSnapshotTimeout<T>(operation: Promise<T>, timeoutMs: number, request: SnapshotRequest) {
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(
-            () => reject(new Error(`snapshot timed out size=${request.width}x${request.height} after=${timeoutMs}ms`)),
-            timeoutMs,
-        );
-    });
-
-    try {
-        return await Promise.race([operation, timeout]);
-    }
-    finally {
-        if (timer)
-            clearTimeout(timer);
-    }
-}
 
 function recommendSnapshotPlugin(console: Console, log: Logger, message: string) {
     if (systemManager.getDeviceByName('@scrypted/snapshot'))
@@ -37,45 +17,31 @@ export function createSnapshotHandler(device: ScryptedDevice & VideoCamera & Cam
         if (!device.interfaces.includes(ScryptedInterface.Camera))
             throw new Error('Camera does not provide native snapshots. Please install the Snapshot Plugin.');
 
-        const requiresFresh = !!request.reason;
-        const isEvent = request.reason === ResourceRequestReason.EVENT;
-        const timeout = requiresFresh
-            ? EVENT_SNAPSHOT_TIMEOUT_MS
-            : PERIODIC_SNAPSHOT_TIMEOUT_MS;
-        return await withSnapshotTimeout((async () => {
-            const media = await device.takePicture({
-                reason: isEvent ? 'event' : 'periodic',
-                picture: {
-                    width: request.width,
-                    height: request.height,
-                },
-                // UniFi Direct owns a four-second periodic recovery budget.
-                // Passing an explicit shorter timeout disables its final
-                // exact-size fallback, so only freshness-sensitive requests
-                // propagate a device deadline. The wrapper still bounds every
-                // periodic capture/conversion at six seconds.
-                ...(requiresFresh ? { timeout } : {}),
-            });
-            return await mediaManager.convertMediaObjectToBuffer(media, 'image/jpeg');
-        })(), timeout, request);
-    }
+        const media = await device.takePicture({
+            // Normalize strictly. HAP defines EVENT as numeric 1; unknown,
+            // omitted, or string-valued reasons are ordinary previews.
+            reason: isEventSnapshotReason(request.reason) ? 'event' : 'periodic',
+            picture: {
+                width: request.width,
+                height: request.height,
+            },
+        });
+        return await mediaManager.convertMediaObjectToBuffer(media, 'image/jpeg');
+    };
 
-    const snapshotCache = new CameraSnapshotCache(takePicture, {
-        diagnostic: message => console.warn(message),
-    });
-    const getPicture = (request: SnapshotRequest) => request.reason
-        ? snapshotCache.getFresh(request)
-        : snapshotCache.getPeriodic(request);
-
-    homekitPlugin.snapshotThrottles.set(device.id, getPicture);
+    // Do not add a second image cache at the HAP boundary. Camera plugins retain
+    // richer freshness and validation state; a generic cache cannot distinguish
+    // a visually verified frame from a fail-open one, and must never let an
+    // event result poison periodic dashboard previews.
+    homekitPlugin.snapshotThrottles.set(device.id, takePicture);
 
     async function handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback) {
         let jpeg: Buffer;
         try {
-            // non zero reason is for homekit secure video... or something else.
-            if (request.reason)
+            // Event snapshots are used by HomeKit Secure Video.
+            if (isEventSnapshotReason(request.reason))
                 console.log('snapshot requested for reason:', request.reason);
-            jpeg = await getPicture(request);
+            jpeg = await takePicture(request);
         }
         catch (e) {
             console.error('snapshot error:', compactSnapshotError(e));
