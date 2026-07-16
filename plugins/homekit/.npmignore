@@ -4,6 +4,7 @@ node_modules/
 *.map
 fs
 src
+test
 .vscode
 dist/*.js
 dist/*.txt

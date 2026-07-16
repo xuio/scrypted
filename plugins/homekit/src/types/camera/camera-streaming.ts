@@ -10,7 +10,6 @@ import { RtspServer } from '@scrypted/common/src/rtsp-server';
 import { addTrackControls, parseSdp } from '@scrypted/common/src/sdp-utils';
 import sdk, { Camera, FFmpegInput, Intercom, MediaStreamFeedback, RequestMediaStreamOptions, ScryptedDevice, ScryptedInterface, ScryptedMimeTypes, VideoCamera, VideoCameraConfiguration } from '@scrypted/sdk';
 import dgram, { SocketType } from 'dgram';
-import { once } from 'events';
 import os from 'os';
 import { getScryptedServerAddress, getScryptedServerAddresses } from '../../address-override';
 import { AudioStreamingCodecType, CameraController, CameraStreamingDelegate, PrepareStreamCallback, PrepareStreamRequest, PrepareStreamResponse, StartStreamRequest, StreamRequestCallback, StreamRequestTypes, StreamingRequest } from '../../hap';
@@ -19,6 +18,7 @@ import { createSnapshotHandler } from '../camera/camera-snapshot';
 import { getDebugMode } from './camera-debug-mode-storage';
 import { createReturnAudioSdp } from './camera-return-audio';
 import { startCameraStreamFfmpeg } from './camera-streaming-ffmpeg';
+import { createInitialVideoRtcpLatch, shouldWaitForInitialVideoRtcp } from './camera-streaming-rtcp';
 import { CameraStreamingSession } from './camera-streaming-session';
 import { getStreamingConfiguration } from './camera-utils';
 
@@ -99,6 +99,7 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
             const { socket: audioReturn, port: audioPort } = await getPort(socketType, sourceAddress);
             videoReturn.setSendBufferSize(1024 * 1024);
             audioReturn.setSendBufferSize(1024 * 1024);
+            const initialVideoReturnRtcp = createInitialVideoRtcpLatch(videoReturn, killPromise);
 
             killPromise.finally(() => {
                 closeQuiet(videoReturn);
@@ -136,6 +137,7 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                 audiossrc,
                 videoReturn,
                 audioReturn,
+                initialVideoReturnRtcp,
                 videoReturnRtcpReady: undefined,
             };
 
@@ -191,6 +193,7 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
             }
 
             session.startRequest = request as StartStreamRequest;
+            session.streamingRequestStartedAt = performance.now();
 
             let forceSlowConnection = false;
             try {
@@ -220,19 +223,23 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                 isWatch,
             } = await getStreamingConfiguration(device, forceSlowConnection, storage, request)
 
-            const hasHomeHub = !!homekitPlugin.storageSettings.values.lastKnownHomeHub;
-            const waitRtcp = forceSlowConnection || isLowBandwidth || !hasHomeHub;
+            // This gate is a legacy workaround for slow/remote Apple paths. Do not
+            // apply it to ordinary standalone local streams: lastKnownHomeHub is
+            // not a reliable signal and made every local request pay the timeout.
+            const isStandalone = storage.getItem('standalone') !== 'false';
+            const waitRtcp = shouldWaitForInitialVideoRtcp(forceSlowConnection, isLowBandwidth, isStandalone);
             if (waitRtcp) {
                 console.log('Will wait for initial RTCP packet.', {
                     isHomeHub: forceSlowConnection,
                     isLowBandwidth,
-                    hasHomeHub,
+                    isStandalone,
                 });
             }
 
             const videoReturnRtcpReady = waitRtcp
-                ? timeoutPromise(1000, once(session.videoReturn, 'message')).catch(() => {
+                ? timeoutPromise(1000, session.initialVideoReturnRtcp).catch(() => {
                     console.warn('Video RTCP Packet timed out. There may be a network (routing/firewall) issue preventing the Apple device sending UDP packets back to Scrypted.');
+                    return false;
                 })
                 : undefined;
             session.videoReturnRtcpReady = videoReturnRtcpReady;

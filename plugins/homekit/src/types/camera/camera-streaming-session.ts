@@ -15,7 +15,9 @@ export interface CameraStreamingSession {
     vconfig: Config;
     videoReturn: dgram.Socket;
     audioReturn: dgram.Socket;
-    videoReturnRtcpReady: Promise<any>;
+    initialVideoReturnRtcp: Promise<boolean>;
+    videoReturnRtcpReady: Promise<boolean>;
+    streamingRequestStartedAt?: number;
     tryReconfigureBitrate?: (reason: string, bitrate: number) => void;
     mediaStreamOptions?: ResponseMediaStreamOptions;
 }
@@ -35,6 +37,15 @@ export async function waitForFirstVideoRtcp(console: Console, session: CameraStr
     if (!session.videoReturnRtcpReady)
         return;
     console.log('Waiting for video RTCP packet before sending video.');
-    await session.videoReturnRtcpReady;
-    console.log('Received first video RTCP packet.');
+    const received = await session.videoReturnRtcpReady;
+    if (session.killed)
+        return;
+    const elapsed = session.streamingRequestStartedAt === undefined
+        ? undefined
+        : Math.round(performance.now() - session.streamingRequestStartedAt);
+    console.log(received
+        ? 'Received first video RTCP packet.'
+        : 'Continuing without an initial video RTCP packet.', elapsed === undefined ? undefined : {
+        streamingRequestElapsedMs: elapsed,
+    });
 }

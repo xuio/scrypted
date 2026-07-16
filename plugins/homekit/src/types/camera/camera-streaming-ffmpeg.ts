@@ -239,8 +239,6 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
     // It is unclear if this will work reliably with ffmpeg/aac-eld which uses it's own
     // ntp timestamp algorithm. aac-eld is deprecated in any case.
 
-    await waitForFirstVideoRtcp(console, session);
-
     if (session.killed) {
         console.log('session ended before streaming could start. bailing.');
         return;
@@ -258,6 +256,19 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
         session.startRequest.video.rtcp_interval,
         videoOptions,
     );
+
+    // Prime the controller's return path before waiting. Some HAP controllers
+    // only emit their first Receiver Report after seeing a Sender Report.
+    // FFmpeg owns SRTP/SRTCP state when the native sender is not in use.
+    if (session.videoReturnRtcpReady && videoIsSrtpSenderCompatible)
+        videoSender.sendRtcp();
+
+    await waitForFirstVideoRtcp(console, session);
+
+    if (session.killed) {
+        console.log('session ended before streaming could start. bailing.');
+        return;
+    }
 
     const rtpTracks: RtpTracks = {
         video: {
@@ -279,6 +290,12 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
                 videoOptions.pps = spsPps?.pps;
             },
             firstPacket() {
+                const elapsed = session.streamingRequestStartedAt === undefined
+                    ? undefined
+                    : Math.round(performance.now() - session.streamingRequestStartedAt);
+                console.log('HomeKit first video RTP packet ready.', elapsed === undefined ? undefined : {
+                    streamingRequestElapsedMs: elapsed,
+                });
                 videoSender.sendRtcp();
             },
             onRtp(rtp) {
