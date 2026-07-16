@@ -236,13 +236,6 @@ export class ReplayPacer<T> {
     }
   }
 
-  private refill(burstBytes: number, bytesPerSecond: number) {
-    const now = this.now();
-    const elapsed = Math.max(0, now - this.lastRefill);
-    this.lastRefill = now;
-    this.tokens = Math.min(burstBytes, this.tokens + elapsed * bytesPerSecond / 1000);
-  }
-
   private async waitForBudget(bytes: number, burstBytes: number, bytesPerSecond: number) {
     // A StreamChunk is one indivisible RTP/RTSP record. A maximum-size
     // interleaved frame can be a few bytes larger than the configured burst;
@@ -255,7 +248,17 @@ export class ReplayPacer<T> {
     this.tokens = Math.min(this.tokens, burstBytes);
 
     while (!this.closed) {
-      this.refill(burstBytes, bytesPerSecond);
+      const now = this.now();
+      const elapsed = Math.max(0, now - this.lastRefill);
+      this.lastRefill = now;
+      // Preserve at most one realistic record of timer overshoot. The old
+      // burst-only clamp discarded every sub-millisecond remainder after
+      // setTimeout rounded upward, making a nominal 6 Mbit/s one-MTU path
+      // deliver only ~4.8 Mbit/s for 1216-byte RTSP records. Capping below two
+      // required records retains the intended one-record critical turns while
+      // carrying enough fractional credit to achieve the configured rate.
+      const refillCap = Math.max(burstBytes, requiredTokens * 2 - 1);
+      this.tokens = Math.min(refillCap, this.tokens + elapsed * bytesPerSecond / 1000);
       if (this.tokens >= requiredTokens) {
         this.tokens -= bytes;
         return;

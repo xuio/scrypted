@@ -231,12 +231,16 @@ test('per-item burst keeps bootstrap to one MTU without inheriting tail credit',
   pacer.start();
   await pacer.waitForIdle();
 
-  assert.deepEqual(writes.map(write => write.at), [0, 1, 2, 3, 4, 5, 6, 7]);
+  // The strict bootstrap retains one near-MTU record per timer turn. The
+  // ordinary two-MTU tail may spend carried fractional credit on two records
+  // in one turn, which is its intended bounded burst.
+  assert.deepEqual(writes.map(write => write.at), [0, 1, 2, 3, 4, 4, 5, 6]);
 });
 
-test('one-MTU branch overtakes sustained 4 Mbit ingress within a bounded transition', async () => {
+test('one-MTU branch carries timer overshoot and overtakes realistic 4 Mbit RTP ingress', async () => {
   let now = 0;
   let liveSequence = 0;
+  let liveCredit = 0;
   let caughtUpAt: number;
   let pacer: ReplayPacer<Item & { burst: number }>;
   pacer = new ReplayPacer<Item & { burst: number }>({
@@ -246,9 +250,11 @@ test('one-MTU branch overtakes sustained 4 Mbit ingress within a bounded transit
     now: () => now,
     sleep: async milliseconds => {
       const elapsed = Math.max(1, Math.ceil(milliseconds));
-      for (let i = 0; i < elapsed; i++) {
-        now++;
-        pacer.enqueue({ id: `live-${liveSequence++}`, bytes: 500, prebuffer: false, burst: ONE_MTU_REPLAY_BURST_BYTES });
+      now += elapsed;
+      liveCredit += elapsed * 500; // 4 Mbit/s
+      while (liveCredit >= 1216) {
+        liveCredit -= 1216;
+        pacer.enqueue({ id: `live-${liveSequence++}`, bytes: 1216, prebuffer: false, burst: ONE_MTU_REPLAY_BURST_BYTES });
       }
     },
     getBytes: item => item.bytes,
@@ -257,8 +263,8 @@ test('one-MTU branch overtakes sustained 4 Mbit ingress within a bounded transit
     onCaughtUp: () => caughtUpAt = now,
   });
   // Four seconds of 4 Mbit/s source backlog.
-  for (let i = 0; i < 2000; i++)
-    pacer.enqueue({ id: `replay-${i}`, bytes: 1000, prebuffer: true, burst: ONE_MTU_REPLAY_BURST_BYTES });
+  for (let i = 0; i < 1645; i++)
+    pacer.enqueue({ id: `replay-${i}`, bytes: 1216, prebuffer: true, burst: ONE_MTU_REPLAY_BURST_BYTES });
   pacer.start();
   await pacer.waitForIdle();
 
