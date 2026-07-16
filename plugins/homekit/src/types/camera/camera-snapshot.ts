@@ -145,10 +145,6 @@ function queueVisualDiagnostic(camera: string, target: Console, jpeg: Buffer, sh
     const key = `${camera}:${sha256}`;
     if (visualSeen.has(key))
         return;
-    visualLastQueued.set(camera, now);
-    visualSeen.add(key);
-    if (visualSeen.size > 128)
-        visualSeen.delete(visualSeen.values().next().value!);
     if (visualQueue.length >= 4) {
         writeDiagnostic(target, 'HKVISUAL', {
             at: new Date().toISOString(),
@@ -158,6 +154,10 @@ function queueVisualDiagnostic(camera: string, target: Console, jpeg: Buffer, sh
         });
         return;
     }
+    visualLastQueued.set(camera, now);
+    visualSeen.add(key);
+    if (visualSeen.size > 128)
+        visualSeen.delete(visualSeen.values().next().value!);
     visualQueue.push({ camera, console: target, jpeg, sha256 });
     drainVisualQueue();
 }
@@ -195,6 +195,7 @@ function installResourceDiagnostics() {
                 if (!queued?.length)
                     delegateDiagnostics.delete(jpeg);
             }
+            const elapsedMs = Date.now() - started;
             setImmediate(() => {
                 const summary = summarizeSnapshotJpeg(jpeg, width, height);
                 writeDiagnostic(console, 'HKRESOURCE', {
@@ -202,7 +203,7 @@ function installResourceDiagnostics() {
                     camera: String(accessoryName || 'unknown').slice(0, 120),
                     reason: diagnosticReason(reason),
                     requested: { width, height },
-                    elapsedMs: Date.now() - started,
+                    elapsedMs,
                     outcome: 'jpeg',
                     ...summary,
                     delegate,
@@ -213,12 +214,13 @@ function installResourceDiagnostics() {
             return jpeg;
         }
         catch (error) {
+            const elapsedMs = Date.now() - started;
             setImmediate(() => writeDiagnostic(console, 'HKRESOURCE', {
                 at: new Date().toISOString(),
                 camera: String(accessoryName || 'unknown').slice(0, 120),
                 reason: diagnosticReason(reason),
                 requested: { width, height },
-                elapsedMs: Date.now() - started,
+                elapsedMs,
                 outcome: 'hap-error',
                 hapStatus: typeof error === 'number' ? error : undefined,
                 error: typeof error === 'number' ? undefined : compactSnapshotError(error),
