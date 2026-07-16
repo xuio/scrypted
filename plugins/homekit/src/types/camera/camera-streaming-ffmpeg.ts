@@ -9,10 +9,13 @@ import { AudioStreamingCodecType, SRTPCryptoSuites } from '../../hap';
 import { getDebugMode } from './camera-debug-mode-storage';
 import { CameraStreamingSession, waitForFirstVideoRtcp } from './camera-streaming-session';
 import { createCameraStreamSender } from './camera-streaming-srtp-sender';
+import { createHomeKitStreamTiming } from './camera-streaming-timing';
 import { checkCompatibleCodec, transcodingDebugModeWarning } from './camera-utils';
+import { selectOpusEncoderFrameDurationMs } from './opus-repacketizer';
 
 export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCamera, console: Console, storage: Storage, ffmpegInput: FFmpegInput, session: CameraStreamingSession) {
     const request = session.startRequest;
+    const streamTiming = createHomeKitStreamTiming(console, () => session.streamingRequestStartedAt);
 
     const videomtu = session.startRequest.video.mtu;
     // 400 seems fine? no idea what to use here. this is the mtu for sending audio to homekit.
@@ -139,24 +142,21 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
     // homekit live streaming is extremely picky about audio audio packet time.
     // not sending packets of the correct duration will result in mute or choppy audio.
     // the packet time parameter is different between LAN and LTE.
-    let opusFramesPerPacket = request.audio.packet_time / 20;
-
     const noAudio = mso?.audio === null;
     if (noAudio) {
-        // no op...
+        streamTiming.onAudioTimingUnavailable('No audio track was selected.');
     }
     else if (audioCodec === AudioStreamingCodecType.OPUS || audioCodec === AudioStreamingCodecType.AAC_ELD) {
-        // by default opus encodes with a packet time of 20. however, homekit may request another value,
-        // which we will respect by simply outputing frames of that duration, rather than packing
-        // 20 ms frames to accomodate.
-        // the opus repacketizer will pass through those N frame packets as is.
+        // Prefer an encoder frame matching HomeKit's requested packet duration.
+        // For non-native durations such as 30 ms, encode an exact divisor and
+        // let the Opus repacketizer combine those frames.
 
         audioArgs.push(
             '-acodec', ...(requestedOpus ?
                 [
                     'libopus',
                     '-application', 'lowdelay',
-                    '-frame_duration', request.audio.packet_time.toString(),
+                    '-frame_duration', selectOpusEncoderFrameDurationMs(request.audio.packet_time).toString(),
                 ] :
                 ['libfdk_aac', '-profile:a', 'aac_eld']),
             '-flags', '+global_header',
@@ -181,8 +181,10 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
                 {
                     audioPacketTime: session.startRequest.audio.packet_time,
                     audioSampleRate: session.startRequest.audio.sample_rate,
-                    framesPerPacket: opusFramesPerPacket,
-                }
+                },
+                {
+                    onRtpSent: () => streamTiming.onAudioRtpSent(),
+                },
             );
 
             firstPacket = function () {
@@ -194,6 +196,7 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
             };
         }
         else {
+            streamTiming.onAudioTimingUnavailable('AAC-ELD is sent by FFmpeg using direct SRTP.');
             // can send aac-eld directly.
             ffmpegDestination = `${session.prepareRequest.targetAddress}:${session.prepareRequest.audio.port}`;
         }
@@ -216,7 +219,10 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
         }
     }
     else {
-        console.warn(device.name, 'homekit requested unknown audio codec, audio will not be streamed.', request);
+        streamTiming.onAudioTimingUnavailable('HomeKit requested an unsupported audio codec.');
+        console.warn(device.name, 'homekit requested unknown audio codec, audio will not be streamed.', {
+            codec: request.audio.codec,
+        });
     }
 
     // 11/15/2022
@@ -255,7 +261,13 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
         session.prepareRequest.video.port, session.prepareRequest.targetAddress,
         session.startRequest.video.rtcp_interval,
         videoOptions,
+        undefined,
+        videoIsSrtpSenderCompatible ? {
+            onRtpSent: rtp => streamTiming.onVideoRtpSent(rtp),
+        } : undefined,
     );
+    if (!videoIsSrtpSenderCompatible)
+        streamTiming.onVideoTimingUnavailable('FFmpeg sends video using direct SRTP.');
 
     // Prime the controller's return path before waiting. Some HAP controllers
     // only emit their first Receiver Report after seeing a Sender Report.

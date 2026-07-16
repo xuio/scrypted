@@ -3,6 +3,7 @@ import sdk, { ObjectDetector, Readme, ScryptedDeviceType, ScryptedInterface, Set
 import { StorageSettings, StorageSettingsDevice } from "@scrypted/sdk/storage-settings";
 import { HomekitMixin } from "./homekit-mixin";
 import { getDebugMode } from "./types/camera/camera-debug-mode-storage";
+import { HOMEKIT_REPLAY_BOOTSTRAP_RATE_CHOICES, HOMEKIT_REPLAY_BOOTSTRAP_RATE_KEY } from "./types/camera/homekit-replay-bootstrap";
 
 const { systemManager, deviceManager, log } = sdk;
 
@@ -104,6 +105,15 @@ ${this.storageSettings.values.qrCode}
                 'FFmpeg',
             ],
             value: this.storage.getItem('rtpSender') || 'Default',
+        });
+
+        settings.push({
+            title: 'IDR Bootstrap Rate',
+            subgroup: 'Advanced',
+            key: HOMEKIT_REPLAY_BOOTSTRAP_RATE_KEY,
+            description: 'HomeKit-only replay rate for decoder-critical SPS/PPS/IDR packets. Adaptive preserves automatic pacing for the High/local stream and uses 8 Mbit/s for medium, remote, and low-resolution streams. Use a fully fixed rate only after measuring the target cameras and network; a rate that is too high can recreate startup loss.',
+            choices: [...HOMEKIT_REPLAY_BOOTSTRAP_RATE_CHOICES],
+            value: this.storage.getItem(HOMEKIT_REPLAY_BOOTSTRAP_RATE_KEY) || 'Default',
         });
 
         let debugMode = getDebugMode(this.storage);

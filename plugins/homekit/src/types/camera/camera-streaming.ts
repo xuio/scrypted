@@ -21,6 +21,7 @@ import { startCameraStreamFfmpeg } from './camera-streaming-ffmpeg';
 import { createInitialVideoRtcpLatch, shouldWaitForInitialVideoRtcp } from './camera-streaming-rtcp';
 import { CameraStreamingSession } from './camera-streaming-session';
 import { getStreamingConfiguration } from './camera-utils';
+import { getHomeKitReplayBootstrapBytesPerSecond, HOMEKIT_REPLAY_BOOTSTRAP_METADATA_KEY, HOMEKIT_REPLAY_BOOTSTRAP_RATE_KEY } from './homekit-replay-bootstrap';
 
 const { mediaManager } = sdk;
 
@@ -40,8 +41,6 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
     const delegate: CameraStreamingDelegate = {
         handleSnapshotRequest: createSnapshotHandler(device, storage, homekitPlugin, console),
         async prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback) {
-            // console.log('prepareStream', Object.assign({}, request, { connection: request.connection.remoteAddress }));
-
             const { sessionID } = request;
             let killResolve: any;
             const streamingSessionStartTime = Date.now();
@@ -171,7 +170,9 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
             callback(null, response);
         },
         async handleStreamRequest(request: StreamingRequest, callback: StreamRequestCallback) {
-            console.log('handleStreamRequest', request);
+            console.log('handleStreamRequest', {
+                type: request.type,
+            });
             if (request.type === StreamRequestTypes.STOP) {
                 sessions.get(request.sessionID)?.kill();
                 callback();
@@ -284,6 +285,10 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
             }
 
             const debugMode = getDebugMode(storage);
+            const replayBootstrapBytesPerSecond = getHomeKitReplayBootstrapBytesPerSecond(
+                storage.getItem(HOMEKIT_REPLAY_BOOTSTRAP_RATE_KEY),
+                destination,
+            );
             const mediaOptions: RequestMediaStreamOptions = {
                 destination,
                 destinationId: session.prepareRequest.targetAddress,
@@ -305,6 +310,9 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                     codec: request.audio.codec === AudioStreamingCodecType.OPUS ? 'opus' : 'pcm',
                 },
                 tool: debugMode.video ? 'ffmpeg' : 'scrypted',
+                metadata: replayBootstrapBytesPerSecond === undefined ? undefined : {
+                    [HOMEKIT_REPLAY_BOOTSTRAP_METADATA_KEY]: replayBootstrapBytesPerSecond,
+                },
             };
 
             const mediaObject = await device.getVideoStream(mediaOptions);

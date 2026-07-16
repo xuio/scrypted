@@ -8,8 +8,17 @@ import dgram from 'dgram';
 import { AudioStreamingSamplerate } from '../../hap';
 import { ntpTime } from './camera-utils';
 import { H264Repacketizer } from './h264-packetizer';
-import { OpusRepacketizer } from './opus-repacketizer';
+import { OpusRepacketizer, repacketizeOpusOrDrop } from './opus-repacketizer';
 import throttle from 'lodash/throttle';
+
+export interface CameraStreamSenderEvents {
+    /**
+     * Called after a repacketized RTP packet has been handed to the UDP socket.
+     * Return true once the requested milestone has been observed to detach this
+     * callback from the steady-state send path.
+     */
+    onRtpSent?: (rtp: RtpPacket) => boolean;
+}
 
 export function createCameraStreamSender(console: Console, config: Config, sender: dgram.Socket, ssrc: number, payloadType: number, port: number, targetAddress: string, rtcpInterval: number,
     videoOptions?: {
@@ -20,20 +29,22 @@ export function createCameraStreamSender(console: Console, config: Config, sende
     audioOptions?: {
         audioPacketTime: number,
         audioSampleRate: AudioStreamingSamplerate,
-        framesPerPacket: number,
-    }) {
+    },
+    events?: CameraStreamSenderEvents) {
     const srtpSession = new SrtpSession(config);
     const srtcpSession = new SrtcpSession(config);
 
-    let firstTimestamp = 0;
+    let firstTimestamp: number | undefined;
     let lastTimestamp = 0;
     let packetCount = 0;
     let octetCount = 0;
     let lastRtcp = 0;
     let firstSequenceNumber: number;
     let opusPacketizer: OpusRepacketizer;
+    let reportMalformedOpusPacket: (error: unknown) => void;
     let h264Packetizer: H264Repacketizer;
     let analyzeVideo = true;
+    let onRtpSent = events?.onRtpSent;
 
     const loggedNaluTypes = new Set<number>();
     const printNaluTypes = () => {
@@ -57,7 +68,15 @@ export function createCameraStreamSender(console: Console, config: Config, sende
                 break;
         }
         audioIntervalScale = audioIntervalScale * audioOptions.audioPacketTime / 20;
-        opusPacketizer = new OpusRepacketizer(audioOptions.framesPerPacket);
+        opusPacketizer = new OpusRepacketizer(audioOptions.audioPacketTime);
+        reportMalformedOpusPacket = throttle((error: unknown) => {
+            console.warn('dropping unusable Opus RTP packet.', {
+                error: error instanceof Error ? error.message : String(error),
+            });
+        }, 10_000, {
+            leading: true,
+            trailing: false,
+        });
     }
     else {
         if (videoOptions.maxPacketSize) {
@@ -109,6 +128,18 @@ export function createCameraStreamSender(console: Console, config: Config, sende
 
         const srtp = srtpSession.encrypt(rtp.payload, rtp.header);
         sender.send(srtp, port, targetAddress);
+        if (onRtpSent) {
+            const callback = onRtpSent;
+            try {
+                if (callback(rtp) && onRtpSent === callback)
+                    onRtpSent = undefined;
+            }
+            catch {
+                // Timing instrumentation must never affect media delivery.
+                if (onRtpSent === callback)
+                    onRtpSent = undefined;
+            }
+        }
     }
 
     function sendRtp(rtp: RtpPacket) {
@@ -117,11 +148,11 @@ export function createCameraStreamSender(console: Console, config: Config, sende
             firstSequenceNumber = rtp.header.sequenceNumber;
         }
 
-        if (!firstTimestamp)
+        if (firstTimestamp === undefined)
             firstTimestamp = rtp.header.timestamp;
 
         if (audioOptions) {
-            const packets = opusPacketizer.repacketize(rtp);
+            const packets = repacketizeOpusOrDrop(opusPacketizer, rtp, reportMalformedOpusPacket);
             if (!packets)
                 return;
 
@@ -141,7 +172,7 @@ export function createCameraStreamSender(console: Console, config: Config, sende
             // HAP requests, and the packet time is respected,
             // opus 48khz will work just fine.
             for (const rtp of packets) {
-                rtp.header.timestamp = (firstTimestamp + packetCount * 160 * audioIntervalScale) % 0xFFFFFFFF;
+                rtp.header.timestamp = (firstTimestamp + packetCount * 160 * audioIntervalScale) % 0x1_0000_0000;
                 sendPacket(rtp);
             }
             return;
