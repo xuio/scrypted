@@ -8,6 +8,7 @@
         "src/types/camera/camera-streaming-rtcp.ts",
         "src/types/camera/camera-streaming-ntp.ts",
         "src/types/camera/camera-streaming-timing.ts",
+        "src/types/camera/camera-snapshot-cache.ts",
         "src/types/camera/homekit-replay-bootstrap.ts",
         "src/types/camera/opus-repacketizer.ts",
         "test/**/*.ts"
