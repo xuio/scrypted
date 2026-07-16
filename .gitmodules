@@ -10,7 +10,7 @@
 	url = ../../koush/scrypted-vscode-typescript/
 [submodule "external/werift"]
 	path = external/werift
-	url = ../../koush/werift-webrtc
+	url = https://github.com/xuio/werift-webrtc.git
 [submodule "plugins/sample-cameraprovider"]
 	path = plugins/sample-cameraprovider
 	url = ../../koush/scrypted-sample-cameraprovider
