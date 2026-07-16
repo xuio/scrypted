@@ -18,13 +18,15 @@ import { ParserOptions, ParserSession, startParserSession } from './ffmpeg-rebro
 import { FileRtspServer } from './file-rtsp-server';
 import { getUrlLocalAdresses } from './local-addresses';
 import { REBROADCAST_MIXIN_INTERFACE_TOKEN } from './rebroadcast-mixin-token';
-import { ReplayBootstrapTracker } from './replay-bootstrap';
-import { calculateReplayBurstBytes, calculateReplayBytesPerSecond, DEFAULT_REPLAY_BURST_BYTES, DEFAULT_REPLAY_MAX_QUEUE_BYTES, ONE_MTU_REPLAY_BURST_BYTES, ONE_MTU_REPLAY_BYTES_PER_SECOND, ReplayPacer, shouldPaceReplay } from './replay-pacer';
+import { filterPrebufferReplayChunks, ReplayBootstrapTracker, shouldBypassReplayForLiveAudio } from './replay-bootstrap';
+import { calculateReplayBurstBytes, calculateReplayBytesPerSecond, DEFAULT_REPLAY_BURST_BYTES, DEFAULT_REPLAY_MAX_QUEUE_BYTES, getHomeKitReplayBootstrapBytesPerSecond, ONE_MTU_REPLAY_BURST_BYTES, ONE_MTU_REPLAY_BYTES_PER_SECOND, ReplayPacer, shouldPaceReplay } from './replay-pacer';
 import { connectRFC4571Parser, startRFC4571Parser } from './rfc4571';
 import { startRtmpSession } from './rtmp-session';
 import { RtspSessionParserSpecific, startRtspSession } from './rtsp-session';
 import { getSpsResolution } from './sps-resolution';
 import { createStreamSettings } from './stream-settings';
+
+const FILTER_DELIVERED_OUT_OF_BAND = Symbol('filter-delivered-out-of-band');
 
 const { mediaManager, log, systemManager, deviceManager } = sdk;
 
@@ -800,7 +802,10 @@ class PrebufferSession {
     socketPromise: Promise<Duplex>,
     requestedPrebuffer: number,
     paceReplay: boolean,
-    filter?: (chunk: StreamChunk, prebuffer: boolean) => StreamChunk,
+    replayBootstrapBytesPerSecond?: number,
+    implicitVideoOnlyCodec?: string,
+    implicitLiveAudioCodec?: string,
+    filter?: (chunk: StreamChunk, prebuffer: boolean) => StreamChunk | typeof FILTER_DELIVERED_OUT_OF_BAND,
   }) {
     const { isActiveClient, session, socketPromise, requestedPrebuffer } = options;
     // this.console.log('sending prebuffer', requestedPrebuffer);
@@ -875,10 +880,17 @@ class PrebufferSession {
       });
     };
 
-    type ReplayItem = { chunk: StreamChunk; prebuffer: boolean; burstBytes: number };
+    type ReplayItem = {
+      chunk: StreamChunk;
+      prebuffer: boolean;
+      burstBytes: number;
+      bytesPerSecond?: number;
+    };
     let replayPacer: ReplayPacer<ReplayItem>;
     let replayBootstrap: ReplayBootstrapTracker;
     let replayTailBurstBytes = DEFAULT_REPLAY_BURST_BYTES;
+    let replayRecordWritten = false;
+    let liveAudioQueued = false;
     let cleanedUp = false;
     let handleLiveData: (chunk: StreamChunk) => void;
     const cleanup = () => {
@@ -893,25 +905,61 @@ class PrebufferSession {
 
     const safeWriteData = (chunk: StreamChunk, prebuffer?: boolean, honorBackpressure?: boolean) => {
       if (options.filter) {
-        chunk = options.filter(chunk, prebuffer);
-        if (!chunk)
-          return;
+        const filtered = options.filter(chunk, prebuffer);
+        if (filtered === FILTER_DELIVERED_OUT_OF_BAND) {
+          return {
+            wrote: true,
+            drain: undefined,
+          };
+        }
+        if (!filtered)
+          return {
+            wrote: false,
+            drain: undefined,
+          };
+        chunk = filtered;
       }
       const result = writeData(chunk);
       if (result.buffered > DEFAULT_REPLAY_MAX_QUEUE_BYTES) {
         this.console.log('more than 100MB has been buffered, did downstream die? killing connection.', this.streamName);
         cleanup();
       }
-      if (honorBackpressure && result.backpressured)
-        return waitForDrain();
+      return {
+        wrote: true,
+        drain: honorBackpressure && result.backpressured
+          ? waitForDrain()
+          : undefined,
+      };
     }
 
     handleLiveData = (chunk: StreamChunk) => {
       if (replayPacer) {
+        const selectedLiveAudio = options.implicitLiveAudioCodec !== undefined
+          && chunk.type === options.implicitLiveAudioCodec;
+        if (!liveAudioQueued && shouldBypassReplayForLiveAudio({
+          chunkType: chunk.type,
+          implicitLiveAudioCodec: options.implicitLiveAudioCodec,
+          replayRecordWritten,
+          writableNeedDrain: socket.writableNeedDrain,
+        })) {
+          // writeData emits the complete StreamChunk synchronously. JavaScript
+          // cannot enter the pacer writer between its RTSP header and payload,
+          // so bypassing the asynchronous FIFO preserves serialized writes.
+          safeWriteData(chunk);
+          return;
+        }
+        // Once selected audio enters the replay FIFO, keep the rest there too;
+        // a later bypass would otherwise overtake that packet after drain.
+        if (selectedLiveAudio)
+          liveAudioQueued = true;
+        const pacing = replayBootstrap.nextPacing(chunk, replayTailBurstBytes);
         replayPacer.enqueue({
           chunk,
           prebuffer: false,
-          burstBytes: replayBootstrap.nextBurstBytes(chunk, replayTailBurstBytes),
+          burstBytes: pacing.burstBytes,
+          bytesPerSecond: pacing.decoderBootstrap
+            ? options.replayBootstrapBytesPerSecond
+            : undefined,
         });
         return;
       }
@@ -939,6 +987,7 @@ class PrebufferSession {
         // this.console.log('Found sync frame in rtsp prebuffer.');
       }
     }
+    availablePrebuffers = filterPrebufferReplayChunks(availablePrebuffers, options.implicitVideoOnlyCodec);
 
     // Selection and listener installation happen in one synchronous turn. New
     // live chunks therefore land after the selected snapshot, with no gap or
@@ -954,14 +1003,20 @@ class PrebufferSession {
       const lastTime = availablePrebuffers[availablePrebuffers.length - 1].time;
       const replaySpan = lastTime - firstTime;
       let bytesPerSecond = calculateReplayBytesPerSecond(replayBytes, replaySpan);
-      const stableFirstTime = prebufferContainer[0]?.time;
-      const stableLastTime = prebufferContainer[prebufferContainer.length - 1]?.time;
+      const stablePrebuffers = filterPrebufferReplayChunks(prebufferContainer, options.implicitVideoOnlyCodec);
+      const stableFirstTime = stablePrebuffers[0]?.time;
+      const stableLastTime = stablePrebuffers[stablePrebuffers.length - 1]?.time;
       const stableSpan = stableLastTime - stableFirstTime;
-      const stableBytes = prebufferContainer.reduce((total, chunk) =>
+      const stableBytes = stablePrebuffers.reduce((total, chunk) =>
         total + chunk.chunks.reduce((chunkTotal, part) => chunkTotal + part.length, chunk.startStream?.length || 0), 0);
       replayTailBurstBytes = calculateReplayBurstBytes(replayBytes, replaySpan, stableBytes, stableSpan);
       if (replayTailBurstBytes === ONE_MTU_REPLAY_BURST_BYTES)
         bytesPerSecond = Math.min(bytesPerSecond, ONE_MTU_REPLAY_BYTES_PER_SECOND);
+      if (options.replayBootstrapBytesPerSecond !== undefined) {
+        this.console.log('using HomeKit decoder bootstrap replay rate.', {
+          megabitsPerSecond: options.replayBootstrapBytesPerSecond * 8 / 1_000_000,
+        });
+      }
       replayBootstrap = new ReplayBootstrapTracker();
       const pacer = new ReplayPacer<ReplayItem>({
         bytesPerSecond,
@@ -969,7 +1024,12 @@ class PrebufferSession {
         maxQueuedBytes: DEFAULT_REPLAY_MAX_QUEUE_BYTES,
         getBytes: item => item.chunk.chunks.reduce((total, part) => total + part.length, item.chunk.startStream?.length || 0),
         getBurstBytes: item => item.burstBytes,
-        write: item => safeWriteData(item.chunk, item.prebuffer, true),
+        getBytesPerSecond: item => item.bytesPerSecond,
+        write: item => {
+          const result = safeWriteData(item.chunk, item.prebuffer, true);
+          replayRecordWritten ||= result.wrote;
+          return result.drain;
+        },
         onCaughtUp: () => {
           if (replayPacer === pacer)
             replayPacer = undefined;
@@ -981,10 +1041,14 @@ class PrebufferSession {
       });
       replayPacer = pacer;
       for (const prebuffer of availablePrebuffers) {
+        const pacing = replayBootstrap.nextPacing(prebuffer, replayTailBurstBytes);
         pacer.enqueue({
           chunk: prebuffer,
           prebuffer: true,
-          burstBytes: replayBootstrap.nextBurstBytes(prebuffer, replayTailBurstBytes),
+          burstBytes: pacing.burstBytes,
+          bytesPerSecond: pacing.decoderBootstrap
+            ? options.replayBootstrapBytesPerSecond
+            : undefined,
         });
       }
       pacer.start();
@@ -1009,6 +1073,7 @@ class PrebufferSession {
 
     let requestedPrebuffer = options?.prebuffer;
     const paceReplay = shouldPaceReplay(requestedPrebuffer);
+    const replayBootstrapBytesPerSecond = getHomeKitReplayBootstrapBytesPerSecond(options);
     // if no prebuffer was requested, try to find a sync frame in the prebuffer.
     // also do this if this request initiated the prebuffer: so, an explicit request for 0 prebuffer
     // will still send the initial sync frame in the stream start. it may otherwise be missed
@@ -1030,7 +1095,7 @@ class PrebufferSession {
     let socketPromise: Promise<Duplex>;
     let url: string;
     let urls: string[];
-    let filter: (chunk: StreamChunk, prebuffer: boolean) => StreamChunk;
+    let filter: (chunk: StreamChunk, prebuffer: boolean) => StreamChunk | typeof FILTER_DELIVERED_OUT_OF_BAND;
     let interleavePassthrough = false;
     const interleavedMap = new Map<string, number>();
     const serverPortMap = new Map<string, RtspTrack>();
@@ -1046,18 +1111,24 @@ class PrebufferSession {
     parsedSdp.msections = parsedSdp.msections.filter(msection => msection === videoSection || msection === audioSection);
     const filterPrebufferAudio = options?.prebuffer === undefined;
     const videoCodec = parsedSdp.msections.find(msection => msection.type === 'video')?.codec;
+    // Preserve the legacy fail-closed behavior when malformed SDP has no video
+    // codec: an implicit live view must never replay cached audio/RTCP alone.
+    const implicitVideoOnlyCodec = filterPrebufferAudio ? videoCodec || '' : undefined;
+    const implicitLiveAudioCodec = filterPrebufferAudio ? audioSection?.codec : undefined;
     sdp = parsedSdp.toSdp();
     filter = (chunk, prebuffer) => {
       // if no prebuffer is explicitly requested, don't send prebuffer audio
-      if (prebuffer && filterPrebufferAudio && chunk.type !== videoCodec)
+      if (prebuffer && implicitVideoOnlyCodec && chunk.type !== implicitVideoOnlyCodec)
         return;
 
       const channel = interleavedMap.get(chunk.type);
       if (!interleavePassthrough) {
         if (channel == undefined) {
           const udp = serverPortMap.get(chunk.type);
-          if (udp)
+          if (udp) {
             server.sendTrack(udp.control, chunk.chunks[1], chunk.type.startsWith('rtcp-'));
+            return FILTER_DELIVERED_OUT_OF_BAND;
+          }
           return;
         }
 
@@ -1077,7 +1148,7 @@ class PrebufferSession {
 
       if (server.writeStream) {
         server.writeRtpPayload(chunk.chunks[0], chunk.chunks[1]);
-        return;
+        return FILTER_DELIVERED_OUT_OF_BAND;
       }
 
       return chunk;
@@ -1138,6 +1209,9 @@ class PrebufferSession {
       session,
       filter,
       paceReplay,
+      replayBootstrapBytesPerSecond,
+      implicitVideoOnlyCodec,
+      implicitLiveAudioCodec,
     });
     mediaStreamOptions.prebuffer = 0;
 
@@ -1315,6 +1389,7 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
                 this.console.log('more than 100MB has been buffered to RTSP Client, did downstream die? killing connection.');
                 client.destroy();
               }
+              return FILTER_DELIVERED_OUT_OF_BAND;
             }
             return undefined;
           }

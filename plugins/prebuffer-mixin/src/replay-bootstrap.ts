@@ -4,6 +4,36 @@ import { ONE_MTU_REPLAY_BURST_BYTES } from './replay-pacer';
 /** One RTP record per timer turn while codec state and the first IDR are sent. */
 export const BOOTSTRAP_REPLAY_BURST_BYTES = ONE_MTU_REPLAY_BURST_BYTES;
 
+/**
+ * Implicit live views intentionally omit cached audio and RTCP. Remove those
+ * records before pacing so packets that will never be written consume neither
+ * queue space nor token-bucket credit. Explicit pre-roll passes no codec and
+ * retains the original byte-for-byte behavior.
+ */
+export function filterPrebufferReplayChunks<T extends Pick<StreamChunk, 'type'>>(chunks: T[], implicitVideoOnlyCodec?: string) {
+  if (implicitVideoOnlyCodec === undefined)
+    return chunks;
+  return chunks.filter(chunk => chunk.type === implicitVideoOnlyCodec);
+}
+
+/**
+ * During an implicit live-view bootstrap, cached audio is intentionally
+ * omitted. Forward the exact selected live audio RTP immediately rather than
+ * queuing it behind the cached video replay. Exact matching keeps RTCP and
+ * unknown records in the replay FIFO; explicit pre-roll passes no codec.
+ */
+export function shouldBypassReplayForLiveAudio(options: {
+  chunkType: string;
+  implicitLiveAudioCodec?: string;
+  replayRecordWritten: boolean;
+  writableNeedDrain: boolean;
+}) {
+  return options.implicitLiveAudioCodec !== undefined
+    && options.chunkType === options.implicitLiveAudioCodec
+    && options.replayRecordWritten
+    && !options.writableNeedDrain;
+}
+
 function isVideoReplayChunk(chunk: StreamChunk) {
   return chunk.type === 'h264' || chunk.type === 'h265';
 }
@@ -155,14 +185,20 @@ export class ReplayBootstrapTracker {
   private critical = true;
   private keyframe: { type: string; ssrc: number; timestamp: number } | undefined;
 
-  nextBurstBytes(chunk: StreamChunk, tailBurstBytes: number) {
+  nextPacing(chunk: StreamChunk, tailBurstBytes: number) {
     // Audio and RTCP are small and low-rate. Keeping them on the one-MTU budget
     // avoids coupling an AAC packet to a simultaneous accelerated video write.
     if (!isVideoReplayChunk(chunk))
-      return BOOTSTRAP_REPLAY_BURST_BYTES;
+      return {
+        burstBytes: BOOTSTRAP_REPLAY_BURST_BYTES,
+        decoderBootstrap: false,
+      };
     const rtp = parseRtp(chunk);
     if (!rtp)
-      return this.critical ? BOOTSTRAP_REPLAY_BURST_BYTES : tailBurstBytes;
+      return {
+        burstBytes: this.critical ? BOOTSTRAP_REPLAY_BURST_BYTES : tailBurstBytes,
+        decoderBootstrap: this.critical,
+      };
     if (isCodecInfoStart(chunk, rtp))
       this.critical = true;
     if (isKeyframeStart(chunk, rtp)) {
@@ -174,7 +210,10 @@ export class ReplayBootstrapTracker {
       };
     }
     if (!this.critical)
-      return tailBurstBytes;
+      return {
+        burstBytes: tailBurstBytes,
+        decoderBootstrap: false,
+      };
 
     const burstBytes = BOOTSTRAP_REPLAY_BURST_BYTES;
     if (this.keyframe
@@ -185,6 +224,13 @@ export class ReplayBootstrapTracker {
       this.critical = false;
       this.keyframe = undefined;
     }
-    return burstBytes;
+    return {
+      burstBytes,
+      decoderBootstrap: true,
+    };
+  }
+
+  nextBurstBytes(chunk: StreamChunk, tailBurstBytes: number) {
+    return this.nextPacing(chunk, tailBurstBytes).burstBytes;
   }
 }
