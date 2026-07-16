@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import test from 'node:test';
-import { EventedHTTPServer } from '../src/hap';
+import { EventedHTTPServer, HAPConnectionState } from '../src/hap';
 import {
     HapResponseBoundaryFramer,
     installHapResponseBoundaryGuard,
@@ -147,7 +147,8 @@ test('multiple response messages in one socket chunk keep distinct boundaries', 
     assert.ok(Buffer.concat(result.chunks.map(chunk => chunk.buffer)).equals(
         Buffer.concat([first, second]),
     ));
-    assert.equal(result.chunks.filter(chunk => chunk.complete).length, 2);
+    assert.equal(result.chunks.filter(chunk => chunk.complete).length, 1);
+    assert.equal(result.chunks.at(-1)?.complete, true);
 });
 
 test('malformed response framing fails closed without forwarding ambiguous bytes', () => {
@@ -274,6 +275,90 @@ test('patched HAP connection closes instead of forwarding malformed response fra
     connection.handleHttpServerResponse(Buffer.from(
         'HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n',
     ));
+    assert.equal(connection.closed, true);
+});
+
+test('patched HAP connection retains queued events across pipelined responses', () => {
+    class FakeConnection {
+        handlingRequest = true;
+        state = 1;
+        eventsTimer = undefined;
+        eventsQueuedForImmediateDelivery = true;
+        eventFlushes = 0;
+        tcpSocket = {
+            write: (_data: Buffer, callback: () => void) => callback(),
+        };
+
+        handleHttpServerRequest() { }
+        handleHttpServerResponse() {
+            assert.fail('upstream response handler must not run');
+        }
+        encrypt(data: Buffer) {
+            return data;
+        }
+        handleTCPSocketWriteFulfilled() { }
+        writeQueuedEventNotifications() {
+            this.eventFlushes++;
+        }
+        close() {
+            assert.fail('valid pipelined responses closed the connection');
+        }
+    }
+    assert.equal(installHapResponseBoundaryGuard(FakeConnection as any), true);
+    const connection = new FakeConnection() as any;
+    connection.handleHttpServerRequest({ method: 'GET', url: '/accessories' });
+    connection.handleHttpServerRequest({ method: 'GET', url: '/characteristics' });
+
+    connection.handleHttpServerResponse(Buffer.from(
+        'HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none',
+    ));
+    assert.equal(connection.eventFlushes, 0);
+    assert.equal(connection.handlingRequest, true);
+
+    connection.handleHttpServerResponse(Buffer.from(
+        'HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo',
+    ));
+    assert.equal(connection.eventFlushes, 1);
+    assert.equal(connection.handlingRequest, false);
+});
+
+test('patched HAP connection does not queue requests ignored during teardown', async () => {
+    class FakeConnection {
+        handlingRequest = true;
+        state = HAPConnectionState.AUTHENTICATED;
+        tcpSocket = {
+            write: (_data: Buffer, callback: () => void) => callback(),
+        };
+        closed = false;
+
+        handleHttpServerRequest(request: { url?: string }) {
+            if (request.url === '/pairings')
+                this.state = HAPConnectionState.TO_BE_TEARED_DOWN;
+        }
+        handleHttpServerResponse() {
+            assert.fail('upstream response handler must not run');
+        }
+        encrypt(data: Buffer) {
+            return data;
+        }
+        handleTCPSocketWriteFulfilled() { }
+        writeQueuedEventNotifications() {
+            assert.fail('tearing-down connection flushed events');
+        }
+        close() {
+            this.closed = true;
+        }
+    }
+    assert.equal(installHapResponseBoundaryGuard(FakeConnection as any), true);
+    const connection = new FakeConnection() as any;
+    connection.handleHttpServerRequest({ method: 'POST', url: '/pairings' });
+    connection.handleHttpServerRequest({ method: 'GET', url: '/accessories' });
+
+    connection.handleHttpServerResponse(Buffer.from(
+        'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}',
+    ));
+    assert.equal(connection.handlingRequest, false);
+    await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(connection.closed, true);
 });
 

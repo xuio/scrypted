@@ -1,7 +1,7 @@
 import { HAPConnection, HAPConnectionState } from './hap';
 
 const RESPONSE_BOUNDARY_GUARD = Symbol.for('@scrypted/homekit/response-boundary-guard');
-const RESPONSE_BOUNDARY_GUARD_VERSION = '2026-07-16-v1';
+const RESPONSE_BOUNDARY_GUARD_VERSION = '2026-07-16-v2';
 const MAX_HTTP_HEADER_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 8 * 1024;
 const HTTP_HEADER_END = Buffer.from('\r\n\r\n');
@@ -314,7 +314,11 @@ export class HapResponseBoundaryFramer {
     }
 
     private finishCurrent(outputs: PendingOutput[], current: CurrentResponse) {
-        if (current.finalResponse) {
+        // Events are safe only when every request already parsed on this HAP
+        // connection has received its final response. A boundary between two
+        // pipelined responses is valid HTTP framing, but the connection is
+        // still handling requests and must retain queued characteristic events.
+        if (current.finalResponse && this.requests.length === 0) {
             for (let index = outputs.length - 1; index >= 0; index--) {
                 if (outputs[index].response !== current)
                     continue;
@@ -427,7 +431,12 @@ export function installHapResponseBoundaryGuard(
         method?: string;
         url?: string;
     }, ...args: any[]) {
-        stateFor(this).enqueue(request?.method);
+        // Mirror HAP-NodeJS' own request eligibility. In particular, a
+        // pipelined request arriving after an unpair operation has moved the
+        // connection to TO_BE_TEARED_DOWN is ignored upstream and therefore
+        // must not create a phantom response in the boundary tracker.
+        if (this.state <= HAPConnectionState.AUTHENTICATED)
+            stateFor(this).enqueue(request?.method);
         return Reflect.apply(originalRequest, this, [request, ...args]);
     };
     prototype.handleHttpServerResponse = function (data: Buffer, ...args: any[]) {
