@@ -1,4 +1,8 @@
 import { HAPConnection, HAPConnectionState } from './hap';
+import {
+    getHapTraceRequestId,
+    traceHapResponseBoundary,
+} from './hap-wire-trace';
 
 const RESPONSE_BOUNDARY_GUARD = Symbol.for('@scrypted/homekit/response-boundary-guard');
 const RESPONSE_BOUNDARY_GUARD_VERSION = '2026-07-16-v2';
@@ -6,8 +10,10 @@ const MAX_HTTP_HEADER_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 8 * 1024;
 const HTTP_HEADER_END = Buffer.from('\r\n\r\n');
 
-interface QueuedRequest {
+export interface HapResponseRequest {
+    id?: string;
     method?: string;
+    url?: string;
 }
 
 type ResponseMode =
@@ -17,7 +23,7 @@ type ResponseMode =
     | { type: 'none' };
 
 interface CurrentResponse {
-    request: QueuedRequest;
+    request: HapResponseRequest;
     mode: ResponseMode;
     finalResponse: boolean;
 }
@@ -28,6 +34,7 @@ interface PendingSlice {
     start: number;
     end: number;
     response: CurrentResponse;
+    responseComplete: boolean;
     complete: boolean;
 }
 
@@ -35,6 +42,8 @@ type PendingOutput = PendingSlice;
 
 export interface HapResponseForwardChunk {
     buffer: Buffer;
+    request: HapResponseRequest;
+    responseComplete: boolean;
     complete: boolean;
 }
 
@@ -198,14 +207,16 @@ class ChunkedBodyTracker {
  * request-handling state until the complete HTTP message has been forwarded.
  */
 export class HapResponseBoundaryFramer {
-    private readonly requests: QueuedRequest[] = [];
+    private readonly requests: HapResponseRequest[] = [];
     private current?: CurrentResponse;
     private failed = false;
 
-    enqueue(method?: string) {
+    enqueue(request?: string | HapResponseRequest) {
         if (this.failed)
             return;
-        this.requests.push({ method });
+        this.requests.push(typeof request === 'string'
+            ? { method: request }
+            : request || {});
     }
 
     private ensureCurrent() {
@@ -309,11 +320,18 @@ export class HapResponseBoundaryFramer {
             start,
             end,
             response: current,
+            responseComplete: false,
             complete: false,
         });
     }
 
     private finishCurrent(outputs: PendingOutput[], current: CurrentResponse) {
+        for (let index = outputs.length - 1; index >= 0; index--) {
+            if (outputs[index].response !== current)
+                continue;
+            outputs[index].responseComplete = true;
+            break;
+        }
         // Events are safe only when every request already parsed on this HAP
         // connection has received its final response. A boundary between two
         // pipelined responses is valid HTTP framing, but the connection is
@@ -362,6 +380,8 @@ export class HapResponseBoundaryFramer {
         return {
             chunks: outputs.map(output => ({
                 buffer: output.input.subarray(output.start, output.end),
+                request: output.response.request,
+                responseComplete: output.responseComplete,
                 complete: output.complete,
             })),
         };
@@ -372,7 +392,24 @@ type PatchableHapConnection = {
     prototype: Record<PropertyKey, any>;
 };
 
-function forwardHapResponseChunk(connection: Record<PropertyKey, any>, data: Buffer, complete: boolean) {
+function forwardHapResponseChunk(
+    connection: Record<PropertyKey, any>,
+    chunk: HapResponseForwardChunk,
+) {
+    const {
+        buffer: data,
+        complete,
+        request,
+        responseComplete,
+    } = chunk;
+    traceHapResponseBoundary(connection, {
+        requestId: request.id,
+        method: request.method,
+        url: request.url,
+        data,
+        responseComplete,
+        allRequestsComplete: complete,
+    });
     const encrypted = connection.encrypt(data);
     connection.tcpSocket.write(
         encrypted,
@@ -436,7 +473,11 @@ export function installHapResponseBoundaryGuard(
         // connection to TO_BE_TEARED_DOWN is ignored upstream and therefore
         // must not create a phantom response in the boundary tracker.
         if (this.state <= HAPConnectionState.AUTHENTICATED)
-            stateFor(this).enqueue(request?.method);
+            stateFor(this).enqueue({
+                id: getHapTraceRequestId(request),
+                method: request?.method,
+                url: request?.url,
+            });
         return Reflect.apply(originalRequest, this, [request, ...args]);
     };
     prototype.handleHttpServerResponse = function (data: Buffer, ...args: any[]) {
@@ -449,11 +490,14 @@ export function installHapResponseBoundaryGuard(
             }
             catch {
             }
+            traceHapResponseBoundary(this, {
+                fatal: result.fatal,
+            });
             this.close();
             return;
         }
         for (const chunk of result.chunks)
-            forwardHapResponseChunk(this, chunk.buffer, chunk.complete);
+            forwardHapResponseChunk(this, chunk);
     };
     prototype[RESPONSE_BOUNDARY_GUARD] = {
         originalRequest,

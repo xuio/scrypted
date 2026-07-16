@@ -9,6 +9,7 @@ import { CameraMixin, canCameraMixin } from './camera-mixin';
 import { SnapshotThrottle, supportedTypes } from './common';
 import { Accessory, Bridge, Categories, Characteristic, ControllerStorage, HAPStorage, MDNSAdvertiser, PublishInfo, Service } from './hap';
 import { installHapResponseBoundaryGuard } from './hap-response-boundary-guard';
+import { installHapWireTrace, registerHapTraceAccessory } from './hap-wire-trace';
 import { createHAPUsernameStorageSettingsDict, getRandomPort as createRandomPort, getHAPUUID, logConnections, typeToCategory } from './hap-utils';
 import { HOMEKIT_MIXIN, HomekitMixin } from './homekit-mixin';
 import { addAccessoryDeviceInfo } from './info';
@@ -21,6 +22,13 @@ import QRCode from 'qrcode-svg';
 
 if (!installHapResponseBoundaryGuard())
     throw new Error('HomeKit HAP response-boundary guard could not be installed');
+try {
+    if (!installHapWireTrace())
+        console.warn('HomeKit HAP wire trace is unavailable; continuing without diagnostics');
+}
+catch {
+    console.warn('HomeKit HAP wire trace could not be installed; continuing without diagnostics');
+}
 
 const hapStorage: Storage = {
     get length() {
@@ -381,6 +389,7 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
         };
 
         this.bridge.publish(publishInfo, true).then(() => {
+            registerHapTraceAccessory(publishInfo.port, this.bridge.displayName);
             this.storageSettings.values.qrCode = new QRCode(this.bridge.setupURI()).svg();
             logConnections(this.console, this.bridge, this.seenConnections);
         });
@@ -452,6 +461,7 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
             advertiser: this.getAdvertiser(),
             bind,
         });
+        registerHapTraceAccessory(port, accessory.displayName);
     }
 
     async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState) {

@@ -1,5 +1,10 @@
 import sdk, { AudioSensor, Camera, Intercom, Logger, MotionSensor, ScryptedDevice, ScryptedInterface, VideoCamera } from "@scrypted/sdk";
 import { SnapshotRequest, SnapshotRequestCallback } from "../../hap";
+import {
+    emitHapWireTrace,
+    inspectHapTraceJpeg,
+    isHapWireTraceActive,
+} from "../../hap-wire-trace";
 import type { HomeKitPlugin } from "../../main";
 import { compactSnapshotError, isEventSnapshotReason } from "./camera-snapshot-policy";
 
@@ -37,6 +42,7 @@ export function createSnapshotHandler(device: ScryptedDevice & VideoCamera & Cam
 
     async function handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback) {
         let jpeg: Buffer;
+        const started = process.hrtime.bigint();
         try {
             // Event snapshots are used by HomeKit Secure Video.
             if (isEventSnapshotReason(request.reason))
@@ -44,10 +50,42 @@ export function createSnapshotHandler(device: ScryptedDevice & VideoCamera & Cam
             jpeg = await takePicture(request);
         }
         catch (e) {
+            try {
+                if (isHapWireTraceActive()) {
+                    emitHapWireTrace({
+                        type: 'hap-snapshot-error',
+                        deviceId: device.id,
+                        camera: device.name,
+                        requestedWidth: request.width,
+                        requestedHeight: request.height,
+                        reason: request.reason,
+                        elapsedMs: Number(process.hrtime.bigint() - started) / 1_000_000,
+                        error: compactSnapshotError(e),
+                    });
+                }
+            }
+            catch {
+            }
             console.error('snapshot error:', compactSnapshotError(e));
             recommendSnapshotPlugin(console, homekitPlugin.log, `${device.name} encountered an error while retrieving a new snapshot. Consider installing the Snapshot Plugin to show the most recent snapshot. origin:/#/component/plugin/install/@scrypted/snapshot}`);
             callback(e);
             return;
+        }
+        try {
+            if (isHapWireTraceActive()) {
+                emitHapWireTrace({
+                    type: 'hap-snapshot-result',
+                    deviceId: device.id,
+                    camera: device.name,
+                    requestedWidth: request.width,
+                    requestedHeight: request.height,
+                    reason: request.reason,
+                    elapsedMs: Number(process.hrtime.bigint() - started) / 1_000_000,
+                    ...inspectHapTraceJpeg(jpeg),
+                });
+            }
+        }
+        catch {
         }
         // Keep callback execution outside the capture try/catch. If a HAP
         // callback itself throws, it must never be invoked a second time.
