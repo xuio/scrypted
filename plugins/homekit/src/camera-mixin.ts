@@ -4,6 +4,7 @@ import { StorageSettings, StorageSettingsDevice } from "@scrypted/sdk/storage-se
 import { HomekitMixin } from "./homekit-mixin";
 import { getDebugMode } from "./types/camera/camera-debug-mode-storage";
 import { HOMEKIT_REPLAY_BOOTSTRAP_RATE_CHOICES, HOMEKIT_REPLAY_BOOTSTRAP_RATE_KEY } from "./types/camera/homekit-replay-bootstrap";
+import { HOMEKIT_SNAPSHOT_TRANSITION_GUARD_KEY } from './types/camera/camera-snapshot-transition-guard';
 
 const { systemManager, deviceManager, log } = sdk;
 
@@ -114,6 +115,15 @@ ${this.storageSettings.values.qrCode}
             description: 'HomeKit-only replay rate for decoder-critical SPS/PPS/IDR packets. Adaptive preserves automatic pacing for the High/local stream and uses 8 Mbit/s for medium, remote, and low-resolution streams. Use a fully fixed rate only after measuring the target cameras and network; a rate that is too high can recreate startup loss.',
             choices: [...HOMEKIT_REPLAY_BOOTSTRAP_RATE_CHOICES],
             value: this.storage.getItem(HOMEKIT_REPLAY_BOOTSTRAP_RATE_KEY) || 'Default',
+        });
+
+        settings.push({
+            title: 'Snapshot Transition Guard (Experimental)',
+            subgroup: 'Debug',
+            key: HOMEKIT_SNAPSHOT_TRANSITION_GUARD_KEY,
+            description: 'Hold periodic snapshot delivery until 300 ms after the latest HomeKit live-stream start or stop transition. This is an opt-in diagnostic for macOS black preview slot races. Event snapshots are never delayed.',
+            type: 'boolean',
+            value: this.storage.getItem(HOMEKIT_SNAPSHOT_TRANSITION_GUARD_KEY) === 'true',
         });
 
         let debugMode = getDebugMode(this.storage);

@@ -15,6 +15,7 @@ import { getScryptedServerAddress, getScryptedServerAddresses } from '../../addr
 import { AudioStreamingCodecType, CameraController, CameraStreamingDelegate, PrepareStreamCallback, PrepareStreamRequest, PrepareStreamResponse, StartStreamRequest, StreamRequestCallback, StreamRequestTypes, StreamingRequest } from '../../hap';
 import type { HomeKitPlugin } from "../../main";
 import { createSnapshotHandler } from '../camera/camera-snapshot';
+import { SnapshotStreamTransition } from './camera-snapshot-transition-guard';
 import { getDebugMode } from './camera-debug-mode-storage';
 import { createReturnAudioSdp } from './camera-return-audio';
 import { startCameraStreamFfmpeg } from './camera-streaming-ffmpeg';
@@ -37,9 +38,22 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
     homekitPlugin: HomeKitPlugin) {
     const sessions = new Map<string, CameraStreamingSession>();
     const twoWayAudio = device.interfaces?.includes(ScryptedInterface.Intercom);
+    let latestStreamTransition: SnapshotStreamTransition | undefined;
+    const markStreamTransition = (kind: SnapshotStreamTransition['kind']) => {
+        latestStreamTransition = {
+            kind,
+            atNs: process.hrtime.bigint(),
+        };
+    };
 
     const delegate: CameraStreamingDelegate = {
-        handleSnapshotRequest: createSnapshotHandler(device, storage, homekitPlugin, console),
+        handleSnapshotRequest: createSnapshotHandler(
+            device,
+            storage,
+            homekitPlugin,
+            console,
+            () => latestStreamTransition,
+        ),
         async prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback) {
             const { sessionID } = request;
             let killResolve: any;
@@ -174,6 +188,7 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                 type: request.type,
             });
             if (request.type === StreamRequestTypes.STOP) {
+                markStreamTransition('stop');
                 sessions.get(request.sessionID)?.kill();
                 callback();
                 return;
@@ -185,6 +200,9 @@ export function createCameraStreamingDelegate(device: ScryptedDevice & VideoCame
                 callback(new Error('unknown session'));
                 return;
             }
+
+            if (request.type === StreamRequestTypes.START)
+                markStreamTransition('start');
 
             callback();
 

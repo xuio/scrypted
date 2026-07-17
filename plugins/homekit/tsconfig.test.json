@@ -9,6 +9,7 @@
         "src/types/camera/camera-streaming-ntp.ts",
         "src/types/camera/camera-streaming-timing.ts",
         "src/types/camera/camera-snapshot-policy.ts",
+        "src/types/camera/camera-snapshot-transition-guard.ts",
         "src/hap-response-boundary-guard.ts",
         "src/hap-wire-trace.ts",
         "src/types/camera/homekit-replay-bootstrap.ts",
