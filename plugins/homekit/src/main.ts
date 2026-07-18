@@ -16,7 +16,6 @@ import { addAccessoryDeviceInfo } from './info';
 import { randomPinCode } from './pincode';
 import './types';
 import { VIDEO_CLIPS_NATIVE_ID } from './types/camera/camera-recording-files';
-import { SnapshotDeliveryGuardCoordinator, SnapshotDeliveryGuardOwner } from './types/camera/camera-snapshot-delivery-guard';
 import { reorderDevicesByProvider } from './util';
 import { VideoClipsMixinProvider } from './video-clips-provider';
 import QRCode from 'qrcode-svg';
@@ -74,8 +73,6 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
     seenConnections = new Set<string>();
     bridge = new Bridge('Scrypted', getHAPUUID(this.storage));
     snapshotThrottles = new Map<string, SnapshotThrottle>();
-    snapshotDeliveryGuard = new SnapshotDeliveryGuardCoordinator();
-    snapshotDeliveryGuardOwners = new Map<string, SnapshotDeliveryGuardOwner>();
     standalones = new Map<string, Accessory>();
     videoClips: VideoClipsMixinProvider;
     videoClipsId: string;
@@ -157,35 +154,6 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
             this.videoClips = new VideoClipsMixinProvider(VIDEO_CLIPS_NATIVE_ID);
             this.videoClipsId = this.videoClips.id;
         })();
-    }
-
-    acquireSnapshotDeliveryGuardOwner(id: string) {
-        const previous = this.snapshotDeliveryGuardOwners.get(id);
-        if (previous)
-            this.snapshotDeliveryGuard.releaseOwner(previous);
-        const owner = this.snapshotDeliveryGuard.createOwner(id);
-        this.snapshotDeliveryGuardOwners.set(id, owner);
-        return owner;
-    }
-
-    releaseCameraSnapshotResources(id: string, expectedMixin?: CameraMixin) {
-        if (expectedMixin && this.cameraMixins.get(id) !== expectedMixin)
-            return;
-        const owner = this.snapshotDeliveryGuardOwners.get(id);
-        if (owner) {
-            this.snapshotDeliveryGuard.releaseOwner(owner);
-            this.snapshotDeliveryGuardOwners.delete(id);
-        }
-        this.snapshotThrottles.delete(id);
-        this.cameraMixins.delete(id);
-    }
-
-    release() {
-        this.snapshotDeliveryGuard.close();
-        this.snapshotDeliveryGuardOwners.clear();
-        this.snapshotThrottles.clear();
-        this.cameraMixins.clear();
-        super.release();
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {
@@ -509,14 +477,9 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
         if (canCameraMixin(mixinDeviceState.type, mixinDeviceInterfaces)) {
             ret = new CameraMixin(options);
             this.cameraMixins.set(ret.id, ret as any);
-            ret.onRelease = () => this.releaseCameraSnapshotResources(ret.id, ret);
         }
         else {
             ret = new HomekitMixin(options);
-            // A device can retain the HomeKit mixin while losing its camera
-            // interfaces. Do not leave the previous snapshot owner/throttle
-            // registered when rebuilding it as a non-camera accessory.
-            this.releaseCameraSnapshotResources(ret.id);
         }
 
         ret.storageSettings.settings.pincode.persistedDefaultValue = randomPinCode();
@@ -525,12 +488,11 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
 
     async releaseMixin(id: string, mixinDevice: any) {
         const device = systemManager.getDeviceById(id);
-        if (device?.mixins?.includes(this.id)) {
+        if (device.mixins?.includes(this.id)) {
             return;
         }
-        this.releaseCameraSnapshotResources(id);
         this.console.log('release mixin', id);
-        this.log.a(`${device?.name || id} was removed. The HomeKit plugin will reload momentarily.`);
+        this.log.a(`${device.name} was removed. The HomeKit plugin will reload momentarily.`);
         deviceManager.requestRestart();
     }
 }
