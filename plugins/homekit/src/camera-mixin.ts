@@ -3,6 +3,7 @@ import sdk, { ObjectDetector, Readme, ScryptedDeviceType, ScryptedInterface, Set
 import { StorageSettings, StorageSettingsDevice } from "@scrypted/sdk/storage-settings";
 import { HomekitMixin } from "./homekit-mixin";
 import { getDebugMode } from "./types/camera/camera-debug-mode-storage";
+import { HOMEKIT_SNAPSHOT_DELIVERY_GUARD_KEY, isSnapshotDeliveryGuardEnabled } from './types/camera/camera-snapshot-delivery-guard';
 import { HOMEKIT_REPLAY_BOOTSTRAP_RATE_CHOICES, HOMEKIT_REPLAY_BOOTSTRAP_RATE_KEY } from "./types/camera/homekit-replay-bootstrap";
 import { HOMEKIT_SNAPSHOT_TRANSITION_GUARD_KEY } from './types/camera/camera-snapshot-transition-guard';
 
@@ -33,6 +34,7 @@ export function createCameraStorageSettings(device: StorageSettingsDevice) {
 
 export class CameraMixin extends HomekitMixin<Readme & VideoCamera> implements Readme {
     cameraStorageSettings = createCameraStorageSettings(this);
+    onRelease?: () => void;
 
     constructor(options: SettingsMixinDeviceOptions<Readme & VideoCamera>) {
         super(options);
@@ -126,6 +128,17 @@ ${this.storageSettings.values.qrCode}
             value: this.storage.getItem(HOMEKIT_SNAPSHOT_TRANSITION_GUARD_KEY) === 'true',
         });
 
+        settings.push({
+            title: 'Snapshot Delivery Guard (Experimental)',
+            subgroup: 'Debug',
+            key: HOMEKIT_SNAPSHOT_DELIVERY_GUARD_KEY,
+            description: 'For periodic Home previews only, wait until 300 ms after request start and space callback handoffs across all cameras by at least 75 ms. Enabled by default for this controlled A/B; event/HKSV snapshots are never scheduled.',
+            type: 'boolean',
+            value: isSnapshotDeliveryGuardEnabled(
+                this.storage.getItem(HOMEKIT_SNAPSHOT_DELIVERY_GUARD_KEY),
+            ),
+        });
+
         let debugMode = getDebugMode(this.storage);
 
         settings.push({
@@ -168,5 +181,14 @@ ${this.storageSettings.values.qrCode}
         }
 
         deviceManager.onMixinEvent(this.id, this, ScryptedInterface.Settings, undefined);
+    }
+
+    async release() {
+        try {
+            this.onRelease?.();
+        }
+        finally {
+            await super.release();
+        }
     }
 }
