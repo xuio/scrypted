@@ -60,13 +60,34 @@ export function createSnapshotHandler(
     async function handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback) {
         let jpeg: Buffer;
         const started = process.hrtime.bigint();
+        const event = isEventSnapshotReason(request.reason);
+        let deliveryGuardEnabled = true;
+        try {
+            deliveryGuardEnabled = isSnapshotDeliveryGuardEnabled(
+                storage.getItem(HOMEKIT_SNAPSHOT_DELIVERY_GUARD_KEY),
+            );
+        }
+        catch {
+            // Storage failure disables the mitigation for this request so the
+            // HAP callback remains strictly fail-open.
+            deliveryGuardEnabled = false;
+        }
+        // Register before awaiting the camera. Cohorts must describe Home's
+        // request arrival order, not the order in which JPEGs become ready.
+        const deliveryTicket = homekitPlugin.snapshotDeliveryGuard.register({
+            enabled: deliveryGuardEnabled,
+            reason: request.reason,
+            startedAtNs: started,
+            owner: deliveryGuardOwner,
+        });
         try {
             // Event snapshots are used by HomeKit Secure Video.
-            if (isEventSnapshotReason(request.reason))
+            if (event)
                 console.log('snapshot requested for reason:', request.reason);
             jpeg = await takePicture(request);
         }
         catch (e) {
+            deliveryTicket.cancel();
             try {
                 if (isHapWireTraceActive()) {
                     emitHapWireTrace({
@@ -88,25 +109,21 @@ export function createSnapshotHandler(
             callback(e);
             return;
         }
-        const readyAtNs = process.hrtime.bigint();
-        const event = isEventSnapshotReason(request.reason);
+        let readyAtNs = started;
+        try {
+            readyAtNs = process.hrtime.bigint();
+        }
+        catch {
+            // The registered ticket must still reach its fail-open delivery
+            // boundary even if the diagnostic monotonic clock is unavailable.
+        }
+        let callbackInvoked = false;
         let transitionGuardEnabled = false;
         try {
             transitionGuardEnabled = storage.getItem(HOMEKIT_SNAPSHOT_TRANSITION_GUARD_KEY) === 'true';
         }
         catch {
             // Preserve fail-open delivery if storage is unavailable.
-        }
-        let deliveryGuardEnabled = true;
-        try {
-            deliveryGuardEnabled = isSnapshotDeliveryGuardEnabled(
-                storage.getItem(HOMEKIT_SNAPSHOT_DELIVERY_GUARD_KEY),
-            );
-        }
-        catch {
-            // Storage failure disables this diagnostic for the request so the
-            // snapshot callback remains fail-open.
-            deliveryGuardEnabled = false;
         }
         let hapTraceActive = false;
         let jpegTrace: ReturnType<typeof inspectHapTraceJpeg> | undefined;
@@ -117,82 +134,111 @@ export function createSnapshotHandler(
         }
         catch {
         }
-        let transitionTrace!: SnapshotTransitionGuardTrace;
-        const pendingTransition = deliverSnapshotWithTransitionGuard({
-            enabled: transitionGuardEnabled,
-            periodic: !event,
-            readyAtNs,
-            latestTransition: () => {
+        let transitionTrace: SnapshotTransitionGuardTrace = {
+            guardReleasedAtNs: readyAtNs,
+            guardDelayMs: 0,
+            guardPlannedMs: 0,
+        };
+        try {
+            try {
+                const pendingTransition = deliverSnapshotWithTransitionGuard({
+                    enabled: transitionGuardEnabled,
+                    periodic: !event,
+                    readyAtNs,
+                    latestTransition: () => {
+                        try {
+                            return latestStreamTransition?.();
+                        }
+                        catch {
+                            return undefined;
+                        }
+                    },
+                }, trace => transitionTrace = trace);
+                if (pendingTransition)
+                    await pendingTransition;
+            }
+            catch {
+                // This diagnostic guard is fail-open. In particular, never
+                // strand the arrival ticket if a clock or future guard change
+                // unexpectedly throws after the JPEG has already been read.
+            }
+
+            const pendingDelivery = deliveryTicket.deliver({
+                readyAtNs,
+            }, trace => {
+                let callbackAtNs = readyAtNs;
                 try {
-                    return latestStreamTransition?.();
+                    callbackAtNs = process.hrtime.bigint();
                 }
                 catch {
-                    return undefined;
                 }
-            },
-        }, trace => transitionTrace = trace);
-        if (pendingTransition)
-            await pendingTransition;
-
-        const pendingDelivery = homekitPlugin.snapshotDeliveryGuard.deliver({
-            enabled: deliveryGuardEnabled,
-            reason: request.reason,
-            startedAtNs: started,
-            readyAtNs,
-            owner: deliveryGuardOwner,
-        }, trace => {
-            // Sample immediately before the exactly-once HAP callback. Trace
-            // emission stays synchronous but happens in finally, so it cannot
-            // compress the process-wide spacing between actual handoffs.
-            const callbackAtNs = process.hrtime.bigint();
-            try {
-                callback(null, jpeg);
-            }
-            finally {
+                // Mark the callback immediately before invoking user code so a
+                // callback exception can never cause a second delivery below.
+                callbackInvoked = true;
                 try {
-                    if (hapTraceActive) {
-                        emitHapWireTrace({
-                            type: 'hap-snapshot-result',
-                            deviceId: device.id,
-                            camera: device.name,
-                            requestedWidth: request.width,
-                            requestedHeight: request.height,
-                            reason: request.reason,
-                            // Preserve elapsedMs as source/result-ready latency
-                            // for existing analyzers. callbackElapsedMs is the
-                            // actual HAP callback handoff.
-                            elapsedMs: Number(readyAtNs - started) / 1_000_000,
-                            readyElapsedMs: Number(readyAtNs - started) / 1_000_000,
-                            callbackElapsedMs: Number(callbackAtNs - started) / 1_000_000,
-                            transitionGuardEnabled,
-                            transitionGuardDelayMs: transitionTrace.guardDelayMs,
-                            transitionGuardPlannedMs: transitionTrace.guardPlannedMs,
-                            nearestStreamTransition: transitionTrace.nearestTransition,
-                            nearestStreamTransitionDeltaMs: transitionTrace.transitionDeltaMs,
-                            deliveryGuardEnabled,
-                            deliveryGuardApplied: trace.applied,
-                            deliveryGuardRequestElapsedMs: trace.requestElapsedMs,
-                            deliveryGuardFloorMs: trace.floorMs,
-                            deliveryGuardFloorSlackMs: trace.floorSlackMs,
-                            deliveryGuardSpacingMs: trace.spacingMs,
-                            deliveryGuardPreviousHandoffDeltaMs: trace.previousHandoffDeltaMs,
-                            deliveryGuardSpacingSlackMs: trace.spacingSlackMs,
-                            deliveryGuardReadyDelayMs: trace.readyDelayMs,
-                            deliveryGuardQueueAhead: trace.queueAhead,
-                            deliveryGuardPlannedSleepMs: trace.plannedSleepMs,
-                            deliveryGuardTimerWaits: trace.timerWaits,
-                            deliveryGuardFailedOpen: trace.failedOpen,
-                            deliveryGuardFailedOpenReason: trace.failedOpenReason,
-                            ...jpegTrace,
-                        });
+                    callback(null, jpeg);
+                }
+                finally {
+                    try {
+                        if (hapTraceActive) {
+                            emitHapWireTrace({
+                                type: 'hap-snapshot-result',
+                                deviceId: device.id,
+                                camera: device.name,
+                                requestedWidth: request.width,
+                                requestedHeight: request.height,
+                                reason: request.reason,
+                                // Preserve elapsedMs as source/result-ready latency
+                                // for existing analyzers. callbackElapsedMs is the
+                                // actual HAP callback handoff.
+                                elapsedMs: Number(readyAtNs - started) / 1_000_000,
+                                readyElapsedMs: Number(readyAtNs - started) / 1_000_000,
+                                callbackElapsedMs: Number(callbackAtNs - started) / 1_000_000,
+                                transitionGuardEnabled,
+                                transitionGuardDelayMs: transitionTrace.guardDelayMs,
+                                transitionGuardPlannedMs: transitionTrace.guardPlannedMs,
+                                nearestStreamTransition: transitionTrace.nearestTransition,
+                                nearestStreamTransitionDeltaMs: transitionTrace.transitionDeltaMs,
+                                deliveryGuardEnabled,
+                                deliveryGuardApplied: trace.applied,
+                                deliveryGuardClassification: trace.classification,
+                                deliveryGuardRequestElapsedMs: trace.requestElapsedMs,
+                                deliveryGuardFloorMs: trace.floorMs,
+                                deliveryGuardFloorSlackMs: trace.floorSlackMs,
+                                deliveryGuardSpacingMs: trace.spacingMs,
+                                deliveryGuardPreviousHandoffDeltaMs: trace.previousHandoffDeltaMs,
+                                deliveryGuardSpacingSlackMs: trace.spacingSlackMs,
+                                deliveryGuardReadyDelayMs: trace.readyDelayMs,
+                                deliveryGuardQueueAhead: trace.queueAhead,
+                                deliveryGuardPlannedSleepMs: trace.plannedSleepMs,
+                                deliveryGuardTimerWaits: trace.timerWaits,
+                                deliveryGuardEligibilityWaitMs: trace.eligibilityWaitMs,
+                                deliveryGuardCohortOwnerCount: trace.cohortOwnerCount,
+                                deliveryGuardCohortSpanMs: trace.cohortSpanMs,
+                                deliveryGuardFailedOpen: trace.failedOpen,
+                                deliveryGuardFailedOpenReason: trace.failedOpenReason,
+                                ...jpegTrace,
+                            });
+                        }
+                    }
+                    catch {
                     }
                 }
-                catch {
-                }
-            }
-        });
-        if (pendingDelivery)
-            await pendingDelivery;
+            });
+            if (pendingDelivery)
+                await pendingDelivery;
+            else if (!callbackInvoked)
+                throw new Error('snapshot delivery guard returned without invoking the callback');
+        }
+        catch (e) {
+            deliveryTicket.cancel();
+            if (callbackInvoked)
+                throw e;
+            // Final fail-open boundary: a valid JPEG is preferable to a hung
+            // HAP request if any post-capture diagnostic scheduler regresses.
+            callbackInvoked = true;
+            callback(null, jpeg);
+        }
     }
 
     return handleSnapshotRequest;

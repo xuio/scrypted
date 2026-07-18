@@ -242,6 +242,20 @@ async function main() {
                 requestedHeight: 720,
                 reason: 0,
                 elapsedMs: 12,
+                readyElapsedMs: 12,
+                callbackElapsedMs: 2701,
+                deliveryGuardEnabled: true,
+                deliveryGuardApplied: true,
+                deliveryGuardClassification: "isolated",
+                deliveryGuardRequestElapsedMs: 2701,
+                deliveryGuardFloorMs: 2700,
+                deliveryGuardSpacingSlackMs: 0.5,
+                deliveryGuardPlannedSleepMs: 2689,
+                deliveryGuardTimerWaits: 2,
+                deliveryGuardEligibilityWaitMs: 2689,
+                deliveryGuardCohortOwnerCount: 1,
+                deliveryGuardCohortSpanMs: 0,
+                deliveryGuardFailedOpen: false,
                 bytes: jpeg.length,
                 sha256: jpegHash,
                 soi: true,
@@ -351,6 +365,10 @@ async function main() {
         assert.equal(analysis.events.resourceRequests[0].resourceResponse.jpeg.jfif, false);
         assert.equal(analysis.events.snapshotResults[0].firstMarker, "0xc0");
         assert.equal(analysis.events.snapshotResults[0].jfif, false);
+        assert.equal(analysis.events.snapshotResults[0].deliveryGuardClassification, "isolated");
+        assert.equal(analysis.events.snapshotResults[0].deliveryGuardRequestElapsedMs, 2701);
+        assert.equal(analysis.events.snapshotResults[0].deliveryGuardFloorMs, 2700);
+        assert.equal(analysis.events.snapshotResults[0].deliveryGuardTimerWaits, 2);
         assert.equal(analysis.homeLogs[0].count, 1);
         assert.equal(analysis.homeLogs[0].diagnosticMarkerCount, 1);
         assert.equal(analysis.snapshotBodyCorrelations[0].exactSourceMatchCount, 1);

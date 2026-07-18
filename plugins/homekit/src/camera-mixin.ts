@@ -132,7 +132,7 @@ ${this.storageSettings.values.qrCode}
             title: 'Snapshot Delivery Guard (Experimental)',
             subgroup: 'Debug',
             key: HOMEKIT_SNAPSHOT_DELIVERY_GUARD_KEY,
-            description: 'For periodic Home previews only, wait until 300 ms after request start and space callback handoffs across all cameras by at least 75 ms. Enabled by default for this controlled A/B; event/HKSV snapshots are never scheduled.',
+            description: 'For periodic Home previews only, keep clustered visible-grid refreshes on the 300 ms path and deliver isolated/offscreen-style requests after Home\'s observed 2.5 s snapshot invalidation. Eligible callbacks are spaced by 75 ms. Enabled by default for this controlled A/B; event/HKSV snapshots always bypass it.',
             type: 'boolean',
             value: isSnapshotDeliveryGuardEnabled(
                 this.storage.getItem(HOMEKIT_SNAPSHOT_DELIVERY_GUARD_KEY),
