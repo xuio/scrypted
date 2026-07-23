@@ -3,13 +3,41 @@ import test from 'node:test';
 import { BOOTSTRAP_REPLAY_BURST_BYTES, filterPrebufferReplayChunks, ReplayBootstrapTracker, shouldBypassReplayForLiveAudio } from '../src/replay-bootstrap';
 import { DEFAULT_REPLAY_BURST_BYTES } from '../src/replay-pacer';
 
-function rtp(type: 'h264' | 'h265' | 'aac' | 'rtcp-h264', payload: number[], marker = false, timestamp = 100, ssrc = 200) {
-  const packet = Buffer.alloc(12 + payload.length);
-  packet[0] = 0x80;
+function rtp(
+  type: 'h264' | 'h265' | 'aac' | 'rtcp-h264',
+  payload: number[],
+  marker = false,
+  timestamp = 100,
+  ssrc = 200,
+  options: {
+    csrc?: number[];
+    extension?: number[];
+    padding?: number;
+  } = {},
+) {
+  const csrc = options.csrc || [];
+  const extension = options.extension || [];
+  const padding = options.padding || 0;
+  const extensionBytes = extension.length ? 4 + extension.length : 0;
+  const payloadOffset = 12 + csrc.length * 4 + extensionBytes;
+  const packet = Buffer.alloc(payloadOffset + payload.length + padding);
+  packet[0] = 0x80
+    | (padding ? 0x20 : 0)
+    | (extension.length ? 0x10 : 0)
+    | csrc.length;
   packet[1] = marker ? 0x80 : 0;
   packet.writeUInt32BE(timestamp, 4);
   packet.writeUInt32BE(ssrc, 8);
-  Buffer.from(payload).copy(packet, 12);
+  csrc.forEach((value, index) => packet.writeUInt32BE(value, 12 + index * 4));
+  if (extension.length) {
+    const extensionOffset = 12 + csrc.length * 4;
+    packet.writeUInt16BE(0xbede, extensionOffset);
+    packet.writeUInt16BE(extension.length / 4, extensionOffset + 2);
+    Buffer.from(extension).copy(packet, extensionOffset + 4);
+  }
+  Buffer.from(payload).copy(packet, payloadOffset);
+  if (padding)
+    packet[packet.length - 1] = padding;
   return { type, chunks: [Buffer.from([0x24, 0, 0, packet.length]), packet] };
 }
 
@@ -37,6 +65,41 @@ test('single-packet H265 IDR marker ends the critical prefix', () => {
     rtp('h265', [1 << 1, 1], true),
   ];
   assert.deepEqual(bursts(chunks), [1500, 1500, 3000]);
+});
+
+test('strict RTP parsing handles CSRC, extensions, and padding', () => {
+  const chunks = [
+    rtp('h264', [0x67], false, 100, 200, {
+      csrc: [300],
+      extension: [0x10, 0x01, 0, 0],
+      padding: 4,
+    }),
+    rtp('h264', [0x65], true, 101, 200, {
+      csrc: [300],
+      extension: [0x10, 0x01, 0, 0],
+      padding: 8,
+    }),
+    rtp('h264', [0x41], true, 102, 200),
+  ];
+  assert.deepEqual(bursts(chunks), [1500, 1500, 3000]);
+});
+
+test('malformed RTP remains conservatively protected', () => {
+  const malformedExtension = rtp('h264', [0x65], true, 100, 200, {
+    extension: [0, 0, 0, 0],
+  });
+  malformedExtension.chunks[1].writeUInt16BE(2, 14);
+  const malformedPadding = rtp('h264', [0x65], true, 100, 200, {
+    padding: 4,
+  });
+  malformedPadding.chunks[1][malformedPadding.chunks[1].length - 1] = malformedPadding.chunks[1].length;
+  const chunks = [
+    malformedExtension,
+    malformedPadding,
+    rtp('h264', [0x65], true, 101),
+    rtp('h264', [0x41], true, 102),
+  ];
+  assert.deepEqual(bursts(chunks), [1500, 1500, 1500, 3000]);
 });
 
 test('missing IDR marker conservatively protects the complete replay', () => {

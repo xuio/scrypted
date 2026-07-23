@@ -142,18 +142,37 @@ type ParsedRtp = {
 
 function parseRtp(chunk: StreamChunk): ParsedRtp | undefined {
   const packet = chunk.chunks[chunk.chunks.length - 1];
-  if (!packet || packet.length <= 12 || (packet[0] & 0xc0) !== 0x80)
+  if (!packet || packet.length <= 12)
     return;
-  const csrcBytes = (packet[0] & 0x0f) * 4;
-  const extensionBytes = packet[0] & 0x10 && packet.length >= 16 + csrcBytes
-    ? 4 + packet.readUInt16BE(14 + csrcBytes) * 4
-    : 0;
-  const payloadOffset = 12 + csrcBytes + extensionBytes;
-  if (payloadOffset >= packet.length)
+  const first = packet[0];
+  if (first >> 6 !== 2)
     return;
+
+  let payloadOffset = 12 + (first & 0x0f) * 4;
+  if (payloadOffset > packet.length)
+    return;
+  if (first & 0x10) {
+    if (payloadOffset + 4 > packet.length)
+      return;
+    const extensionBytes = packet.readUInt16BE(payloadOffset + 2) * 4;
+    payloadOffset += 4 + extensionBytes;
+    if (payloadOffset > packet.length)
+      return;
+  }
+
+  let payloadEnd = packet.length;
+  if (first & 0x20) {
+    const paddingBytes = packet[packet.length - 1];
+    if (!paddingBytes || paddingBytes > payloadEnd - payloadOffset)
+      return;
+    payloadEnd -= paddingBytes;
+  }
+  if (payloadEnd <= payloadOffset)
+    return;
+
   return {
     marker: !!(packet[1] & 0x80),
-    payload: packet.subarray(payloadOffset),
+    payload: packet.subarray(payloadOffset, payloadEnd),
     ssrc: packet.readUInt32BE(8),
     timestamp: packet.readUInt32BE(4),
   };
